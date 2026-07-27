@@ -24,6 +24,7 @@ MODULE nnp_neighbor_interface
                                               nnp_neighbor_interface_state_release,&
                                               nnp_neighbor_workspace_type,&
                                               nnp_type
+!$ USE OMP_LIB,                          ONLY: omp_get_max_threads, omp_get_thread_num
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -79,9 +80,13 @@ CONTAINS
       TYPE(nnp_type), INTENT(INOUT)                      :: nnp
       INTEGER, INTENT(IN)                                :: ind
 
-      nnp%neighbor_interface_state%workspace(ind)%neighbor%n_rad(:) = 0
-      nnp%neighbor_interface_state%workspace(ind)%neighbor%n_ang1(:) = 0
-      nnp%neighbor_interface_state%workspace(ind)%neighbor%n_ang2(:) = 0
+      INTEGER                                            :: tid
+
+      tid = 1
+!$    tid = omp_get_thread_num() + 1
+      nnp%neighbor_interface_state%workspace(ind, tid)%neighbor%n_rad(:) = 0
+      nnp%neighbor_interface_state%workspace(ind, tid)%neighbor%n_ang1(:) = 0
+      nnp%neighbor_interface_state%workspace(ind, tid)%neighbor%n_ang2(:) = 0
 
    END SUBROUTINE nnp_neighbor_interface_reset_neighbor
 
@@ -129,7 +134,7 @@ CONTAINS
 
       TYPE(nnp_type), INTENT(INOUT)                      :: nnp
 
-      INTEGER                                            :: i
+      INTEGER                                            :: i, nthreads, t
 
       ASSOCIATE (state => nnp%neighbor_interface_state)
          state%n_ele = nnp%n_ele
@@ -138,7 +143,11 @@ CONTAINS
          ALLOCATE (state%n_radgrp(nnp%n_ele))
          ALLOCATE (state%n_anggrp(nnp%n_ele))
          ALLOCATE (state%pair_map(nnp%n_ele, nnp%n_ele))
-         ALLOCATE (state%workspace(nnp%n_ele))
+         ! One workspace column per OpenMP thread so the atom-level parallel
+         ! loop in nnp_calc_energy_force is race-free.
+         nthreads = 1
+!$       nthreads = omp_get_max_threads()
+         ALLOCATE (state%workspace(nnp%n_ele, nthreads))
 
          DO i = 1, nnp%n_ele
             state%n_rad(i) = nnp%n_rad(i)
@@ -149,7 +158,9 @@ CONTAINS
 
          DO i = 1, nnp%n_ele
             CALL nnp_neighbor_interface_build_pair_map_for_element(nnp, i)
-            CALL nnp_neighbor_interface_init_workspace_metadata(nnp, i)
+            DO t = 1, nthreads
+               CALL nnp_neighbor_interface_init_workspace_metadata(nnp, i, t)
+            END DO
          END DO
 
          state%initialized = .TRUE.
@@ -224,14 +235,14 @@ CONTAINS
 !> \param nnp  NNP environment providing per-element SF group definitions
 !> \param ind  central-element index whose scratch workspace metadata is cached
 ! **************************************************************************************************
-   SUBROUTINE nnp_neighbor_interface_init_workspace_metadata(nnp, ind)
+   SUBROUTINE nnp_neighbor_interface_init_workspace_metadata(nnp, ind, tid)
 
       TYPE(nnp_type), INTENT(INOUT)                      :: nnp
-      INTEGER, INTENT(IN)                                :: ind
+      INTEGER, INTENT(IN)                                :: ind, tid
 
       INTEGER                                            :: s
 
-      ASSOCIATE (workspace => nnp%neighbor_interface_state%workspace(ind))
+      ASSOCIATE (workspace => nnp%neighbor_interface_state%workspace(ind, tid))
          workspace%max_rad_symf = 0
          workspace%max_ang_symf = 0
          workspace%n_input_nodes = nnp%n_rad(ind) + nnp%n_ang(ind)

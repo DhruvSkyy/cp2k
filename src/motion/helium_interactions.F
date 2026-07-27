@@ -752,9 +752,11 @@ CONTAINS
          IF (PRESENT(force)) THEN
             helium%nnp%arc(ind)%layer(1)%node_grad(:) = 0.0_dp
             ALLOCATE (denergydsym(helium%nnp%arc(ind)%n_nodes(1)))
-            CALL nnp_calc_acsf(nnp, i, .TRUE.)
+            ! Serial coupling path: write the descriptor straight into the
+            ! shared nnp%arc(ind), matching the pre-OpenMP behaviour.
+            CALL nnp_calc_acsf(nnp, i, .TRUE., nnp%arc(ind))
          ELSE
-            CALL nnp_calc_acsf(nnp, i, .FALSE.)
+            CALL nnp_calc_acsf(nnp, i, .FALSE., nnp%arc(ind))
          END IF
 
          ! input nodes filled, perform prediction:

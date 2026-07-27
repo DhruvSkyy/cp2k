@@ -32,7 +32,8 @@ MODULE nnp_force
                                               dp
    USE nnp_acsf,                        ONLY: nnp_calc_acsf,&
                                               nnp_prepare_neighbor_cache
-   USE nnp_environment_types,           ONLY: nnp_env_get,&
+   USE nnp_environment_types,           ONLY: nnp_arc_type,&
+                                              nnp_env_get,&
                                               nnp_type
    USE nnp_model,                       ONLY: nnp_gradients,&
                                               nnp_predict
@@ -40,6 +41,7 @@ MODULE nnp_force
    USE periodic_table,                  ONLY: get_ptable_info
    USE physcon,                         ONLY: angstrom
    USE virial_types,                    ONLY: virial_type
+!$ USE OMP_LIB,                          ONLY: omp_get_max_threads, omp_get_thread_num
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -66,13 +68,20 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER :: routineN = 'nnp_calc_energy_force'
 
-      INTEGER                                            :: handle, handle_loop, i, i_com, ig, ind, &
-                                                            istart, j, k, m, max_input_nodes, &
-                                                            mecalc, n_input_nodes
+      INTEGER                                            :: handle, handle_loop, i, i_com, ie, ig, &
+                                                            il, ind, istart, j, k, m, &
+                                                            max_input_nodes, mecalc, n_input_nodes, &
+                                                            nthreads, t, tid
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: allcalc
       LOGICAL                                            :: calc_stress
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: denergydsym
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: stress
+      ! Per-thread force / stress accumulators, folded deterministically (ascending
+      ! thread order) after the loop so a fixed thread count is bit-reproducible.
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :)  :: my_force_t, my_cstress_t
+      ! Per-thread clone of the network state (input/hidden node scratch). Weights
+      ! are read-only during MD; cloning them keeps nnp%arc untouched and race-free.
+      TYPE(nnp_arc_type), ALLOCATABLE, DIMENSION(:)      :: my_arc
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(cp_subsys_type), POINTER                      :: subsys
@@ -141,83 +150,151 @@ CONTAINS
       CALL nnp_prepare_neighbor_cache(nnp)
 
       max_input_nodes = 0
+      DO i = 1, nnp%n_ele
+         max_input_nodes = MAX(max_input_nodes, nnp%arc(i)%n_nodes(1))
+      END DO
+
+      ! Number of OpenMP threads that will run the atom loop; sizes the
+      ! per-thread force/stress accumulators.
+      nthreads = 1
+!$    nthreads = omp_get_max_threads()
       IF (calc_forces) THEN
-         DO i = 1, nnp%n_ele
-            max_input_nodes = MAX(max_input_nodes, nnp%arc(i)%n_nodes(1))
-         END DO
          ! dGdr lives in per-element workspace; no global (3, n_sf, num_atoms) slab.
+         ALLOCATE (my_force_t(3, nnp%num_atoms, nnp%n_committee, 0:nthreads - 1))
+         my_force_t(:, :, :, :) = 0.0_dp
          IF (calc_stress) THEN
-            ALLOCATE (stress(3, 3, max_input_nodes))
-            stress(:, :, :) = 0.0_dp
+            ALLOCATE (my_cstress_t(3, 3, nnp%n_committee, 0:nthreads - 1))
+            my_cstress_t(:, :, :, :) = 0.0_dp
          END IF
-         ALLOCATE (denergydsym(max_input_nodes))
-         denergydsym(:) = 0.0_dp
       END IF
 
       ! Per-rank timer around the per-atom work. CP2K aggregates the label as
       ! avg/max across ranks, so max - avg measures the load imbalance.
       CALL timeset('nnp_per_rank_atom_loop', handle_loop)
 
+      ! Atom-level OpenMP. Each thread owns a private network clone (my_arc), a
+      ! private workspace column (selected by omp_get_thread_num inside the ACSF
+      ! and scatter routines) and a private slab of my_force_t/my_cstress_t, so
+      ! the loop body is race-free. SCHEDULE(STATIC) fixes the atom->thread map,
+      ! which together with the ascending-thread fold below makes the result
+      ! bit-reproducible at a fixed thread count.
+      !$OMP PARALLEL DEFAULT(SHARED) &
+      !$OMP          PRIVATE(i, i_com, ind, ie, il, j, n_input_nodes, tid, my_arc, denergydsym, stress)
+
+      tid = 1
+!$    tid = omp_get_thread_num() + 1
+
+      ! Build this thread's network clone once per force evaluation. Layer
+      ! scalars are ALLOCATABLE (deep-copied on assignment); %layer is a POINTER
+      ! array, so it is allocated/freed explicitly to avoid a leak.
+      ALLOCATE (my_arc(nnp%n_ele))
+      DO ie = 1, nnp%n_ele
+         my_arc(ie)%n_nodes = nnp%arc(ie)%n_nodes
+         ALLOCATE (my_arc(ie)%layer(nnp%n_layer))
+         DO il = 1, nnp%n_layer
+            IF (ALLOCATED(nnp%arc(ie)%layer(il)%weights)) &
+               my_arc(ie)%layer(il)%weights = nnp%arc(ie)%layer(il)%weights
+            IF (ALLOCATED(nnp%arc(ie)%layer(il)%bweights)) &
+               my_arc(ie)%layer(il)%bweights = nnp%arc(ie)%layer(il)%bweights
+            IF (ALLOCATED(nnp%arc(ie)%layer(il)%node)) &
+               my_arc(ie)%layer(il)%node = nnp%arc(ie)%layer(il)%node
+            IF (ALLOCATED(nnp%arc(ie)%layer(il)%node_grad)) &
+               my_arc(ie)%layer(il)%node_grad = nnp%arc(ie)%layer(il)%node_grad
+            IF (ALLOCATED(nnp%arc(ie)%layer(il)%tmp_der)) &
+               my_arc(ie)%layer(il)%tmp_der = nnp%arc(ie)%layer(il)%tmp_der
+         END DO
+      END DO
+
+      IF (calc_forces) THEN
+         ALLOCATE (denergydsym(max_input_nodes))
+         denergydsym(:) = 0.0_dp
+         IF (calc_stress) THEN
+            ALLOCATE (stress(3, 3, max_input_nodes))
+            stress(:, :, :) = 0.0_dp
+         END IF
+      END IF
+
       ! calc atomic contribution to energy and force
+      !$OMP DO SCHEDULE(STATIC)
       DO i = istart, istart + mecalc - 1
 
          ! determine index of atom type and offset
          ind = nnp%ele_ind(i)
          n_input_nodes = nnp%arc(ind)%n_nodes(1)
 
-         ! reset input nodes of ele(ind):
-         nnp%arc(ind)%layer(1)%node(:) = 0.0_dp
+         ! reset input nodes of ele(ind) in this thread's clone:
+         my_arc(ind)%layer(1)%node(:) = 0.0_dp
 
          ! compute sym fnct values
          IF (calc_forces) THEN
             !reset input grads of ele(ind):
-            nnp%arc(ind)%layer(1)%node_grad(:) = 0.0_dp
+            my_arc(ind)%layer(1)%node_grad(:) = 0.0_dp
             IF (calc_stress) THEN
                stress(:, :, 1:n_input_nodes) = 0.0_dp
-               CALL nnp_calc_acsf(nnp, i, .TRUE., stress(:, :, 1:n_input_nodes))
+               CALL nnp_calc_acsf(nnp, i, .TRUE., my_arc(ind), stress(:, :, 1:n_input_nodes))
             ELSE
-               CALL nnp_calc_acsf(nnp, i, .TRUE.)
+               CALL nnp_calc_acsf(nnp, i, .TRUE., my_arc(ind))
             END IF
          ELSE
-            CALL nnp_calc_acsf(nnp, i, .FALSE.)
+            CALL nnp_calc_acsf(nnp, i, .FALSE., my_arc(ind))
          END IF
 
          DO i_com = 1, nnp%n_committee
             ! predict energy
-            CALL nnp_predict(nnp%arc(ind), nnp, i_com)
-            nnp%atomic_energy(i, i_com) = nnp%arc(ind)%layer(nnp%n_layer)%node(1) + &
+            CALL nnp_predict(my_arc(ind), nnp, i_com)
+            nnp%atomic_energy(i, i_com) = my_arc(ind)%layer(nnp%n_layer)%node(1) + &
                                           nnp%atom_energies(ind)
 
             ! predict forces
             IF (calc_forces) THEN
                denergydsym(1:n_input_nodes) = 0.0_dp
-               CALL nnp_gradients(nnp%arc(ind), nnp, i_com, denergydsym(1:n_input_nodes))
+               CALL nnp_gradients(my_arc(ind), nnp, i_com, denergydsym(1:n_input_nodes))
 
-               ! Force scatter over the per-element workspace dGdr arrays; see
+               ! Force scatter into this thread's private accumulator slab; see
                ! nnp_scatter_dgdr_to_forces below, also reused by the helium-NNP
                ! coupling in src/motion/helium_interactions.F.
                CALL nnp_scatter_dgdr_to_forces(nnp, ind, i, denergydsym(1:n_input_nodes), &
-                                               nnp%myforce(:, :, i_com))
+                                               my_force_t(:, :, i_com, tid - 1))
 
                IF (calc_stress) THEN
                   DO j = 1, n_input_nodes
-                     nnp%committee_stress(:, :, i_com) = nnp%committee_stress(:, :, i_com) - &
-                                                         denergydsym(j)*stress(:, :, j)
+                     my_cstress_t(:, :, i_com, tid - 1) = my_cstress_t(:, :, i_com, tid - 1) - &
+                                                          denergydsym(j)*stress(:, :, j)
                   END DO
                END IF
             END IF
          END DO
 
       END DO ! loop over num_atoms
-
-      CALL timestop(handle_loop)
+      !$OMP END DO
 
       IF (calc_forces) THEN
          DEALLOCATE (denergydsym)
+         IF (calc_stress) DEALLOCATE (stress)
+      END IF
+      DO ie = 1, nnp%n_ele
+         DEALLOCATE (my_arc(ie)%layer)
+      END DO
+      DEALLOCATE (my_arc)
+      !$OMP END PARALLEL
+
+      ! Deterministic fold: sum per-thread slabs in ascending thread order into
+      ! the shared accumulators (which were zeroed above). Fixed order => a fixed
+      ! thread count reproduces bitwise.
+      IF (calc_forces) THEN
+         DO t = 0, nthreads - 1
+            nnp%myforce(:, :, :) = nnp%myforce(:, :, :) + my_force_t(:, :, :, t)
+         END DO
+         DEALLOCATE (my_force_t)
          IF (calc_stress) THEN
-            DEALLOCATE (stress)
+            DO t = 0, nthreads - 1
+               nnp%committee_stress(:, :, :) = nnp%committee_stress(:, :, :) + my_cstress_t(:, :, :, t)
+            END DO
+            DEALLOCATE (my_cstress_t)
          END IF
       END IF
+
+      CALL timestop(handle_loop)
 
       ! calculate energy:
       CALL logger%para_env%sum(nnp%atomic_energy(:, :))
@@ -720,13 +797,15 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: force_xyz
 
       INTEGER                                            :: j, k, k_atom, m, n_ang1_s, n_ang2_s, &
-                                                            n_input_nodes, n_symf_s, off, s, sf
+                                                            n_input_nodes, n_symf_s, off, s, sf, tid
       LOGICAL                                            :: homo_grp
       REAL(KIND=dp)                                      :: de
 
-      ASSOCIATE (workspace => nnp%neighbor_interface_state%workspace(ind), &
-                 neighbor => nnp%neighbor_interface_state%workspace(ind)%neighbor, &
-                 self_dGdr => nnp%neighbor_interface_state%workspace(ind)%self_dGdr)
+      tid = 1
+!$    tid = omp_get_thread_num() + 1
+      ASSOCIATE (workspace => nnp%neighbor_interface_state%workspace(ind, tid), &
+                 neighbor => nnp%neighbor_interface_state%workspace(ind, tid)%neighbor, &
+                 self_dGdr => nnp%neighbor_interface_state%workspace(ind, tid)%self_dGdr)
 
          n_input_nodes = workspace%n_input_nodes
 

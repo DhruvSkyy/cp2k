@@ -24,6 +24,7 @@ MODULE nnp_acsf
                                               nnp_prepare_cell_list_cache
    USE nnp_environment_types,           ONLY: nnp_acsf_ang_type,&
                                               nnp_acsf_rad_type,&
+                                              nnp_arc_type,&
                                               nnp_cut_cos,&
                                               nnp_cut_tanh,&
                                               nnp_symfgrp_type,&
@@ -34,7 +35,7 @@ MODULE nnp_acsf
                                               nnp_workspace_grow_caches
    USE periodic_table,                  ONLY: get_ptable_info
 
-!$ USE omp_lib, ONLY: omp_get_max_threads
+!$ USE omp_lib, ONLY: omp_get_thread_num
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -80,18 +81,24 @@ CONTAINS
 !> \author Christoph Schran (christoph.schran@rub.de)
 !> \author Dhruv Sharma (ds2173@cam.ac.uk)
 ! **************************************************************************************************
-   SUBROUTINE nnp_calc_acsf(nnp, i, calc_forces, stress)
+   SUBROUTINE nnp_calc_acsf(nnp, i, calc_forces, arc, stress)
 
       TYPE(nnp_type), INTENT(INOUT), POINTER             :: nnp
       INTEGER, INTENT(IN)                                :: i
       LOGICAL, INTENT(IN)                                :: calc_forces
+      ! Thread-private network clone written by nnp_scale_acsf; under atom-level
+      ! OpenMP each thread passes its own arc so the input layer is race-free.
+      TYPE(nnp_arc_type), INTENT(INOUT)                  :: arc
       REAL(KIND=dp), DIMENSION(:, :, :), INTENT(INOUT), &
          OPTIONAL                                        :: stress
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'nnp_calc_acsf'
 
       INTEGER :: handle, handle_nlist, handle_sf, ii, ind, izeta_il, j, k, l, m, n_ang1_s, &
-         n_ang2_s, n_input_nodes, n_symf_s, nthreads_ang, off, peak, s, sf
+         n_ang2_s, n_input_nodes, n_symf_s, off, peak, s, sf, tid
+      ! Thread-private symmetry-function value accumulators (were the shared
+      ! nnp%rad(ind)%y / nnp%ang(ind)%y in the serial upstream).
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: rad_y, ang_y
       LOGICAL                                            :: do_forces, homo_grp
       REAL(KIND=dp) :: angular_il, arg_il, costheta_il, cutoff_s, cutoff_sqr, dfcut3_il, &
          dfcutdr1_il, dfcutdr2_il, dfcutdr3_il, dgdx_t1, dgdx_t2, dsymdr1_il, dsymdr2_il, &
@@ -113,6 +120,15 @@ CONTAINS
       ind = nnp%ele_ind(i)
       do_forces = calc_forces
 
+      ! OpenMP thread id (1-based); selects this thread's private workspace
+      ! column. Outside a parallel region this is 1, matching serial behaviour.
+      tid = 1
+!$    tid = omp_get_thread_num() + 1
+
+      ! Local thread-private SF value accumulators, sized for this element.
+      ALLOCATE (rad_y(nnp%n_rad(ind)))
+      ALLOCATE (ang_y(nnp%n_ang(ind)))
+
       ! Lazy one-shot build of the per-radial-group spline tables. They depend
       ! only on eta/rs/cutoff/cut_type, fixed once nnp_init_acsf_groups and
       ! nnp_sort_acsf have run; %spline_built is per-nnp so re-init is safe.
@@ -125,15 +141,15 @@ CONTAINS
       ! via nnp_grp_grow_dGdr; the fc_cache*/dfc_cache* buffers are bound in an
       ! inner ASSOCIATE after nnp_workspace_grow_caches has sized them, so the
       ! alias stays valid.
-      ASSOCIATE (workspace => nnp%neighbor_interface_state%workspace(ind), &
-                 neighbor => nnp%neighbor_interface_state%workspace(ind)%neighbor, &
-                 radial_symtmp => nnp%neighbor_interface_state%workspace(ind)%radial_sym, &
-                 radial_forcetmp => nnp%neighbor_interface_state%workspace(ind)%radial_force, &
-                 angular_symtmp => nnp%neighbor_interface_state%workspace(ind)%angular_sym, &
-                 angular_force3tmp => nnp%neighbor_interface_state%workspace(ind)%angular_force, &
-                 self_dGdr => nnp%neighbor_interface_state%workspace(ind)%self_dGdr)
+      ASSOCIATE (workspace => nnp%neighbor_interface_state%workspace(ind, tid), &
+                 neighbor => nnp%neighbor_interface_state%workspace(ind, tid)%neighbor, &
+                 radial_symtmp => nnp%neighbor_interface_state%workspace(ind, tid)%radial_sym, &
+                 radial_forcetmp => nnp%neighbor_interface_state%workspace(ind, tid)%radial_force, &
+                 angular_symtmp => nnp%neighbor_interface_state%workspace(ind, tid)%angular_sym, &
+                 angular_force3tmp => nnp%neighbor_interface_state%workspace(ind, tid)%angular_force, &
+                 self_dGdr => nnp%neighbor_interface_state%workspace(ind, tid)%self_dGdr)
 
-         n_input_nodes = nnp%neighbor_interface_state%workspace(ind)%n_input_nodes
+         n_input_nodes = nnp%neighbor_interface_state%workspace(ind, tid)%n_input_nodes
          IF (do_forces) self_dGdr(:, 1:n_input_nodes) = 0.0_dp
 
          ! Walk the linked-cell candidates directly. The cell-list/neighbour cache
@@ -146,8 +162,8 @@ CONTAINS
          CALL timestop(handle_nlist)
 
          ! Reset y:
-         nnp%rad(ind)%y = 0.0_dp
-         nnp%ang(ind)%y = 0.0_dp
+         rad_y = 0.0_dp
+         ang_y = 0.0_dp
 
          ! Grow the per-element 1D angular cutoff caches to this atom's peak
          ! per-group neighbour count, then bind them in an inner ASSOCIATE.
@@ -192,7 +208,7 @@ CONTAINS
                                  stress(:, l, m) = stress(:, l, m) + rvect1(:)*radial_forcetmp(l, sf)
                               END DO
                            END IF
-                           nnp%rad(ind)%y(m) = nnp%rad(ind)%y(m) + radial_symtmp(sf)
+                           rad_y(m) = rad_y(m) + radial_symtmp(sf)
                         END DO
                      END DO
                   END ASSOCIATE
@@ -203,17 +219,18 @@ CONTAINS
                CALL timeset('nnp_acsf_angular', handle_sf)
                off = nnp%n_rad(ind)
 
-               ! OpenMP over the angular group index s, taken only with >1 thread
-               ! and >1 group. Angular groups partition the input-node index m
-               ! disjointly (nnp_sort_acsf), so self_dGdr, stress and y are written
-               ! without races. The serial path below is identical.
-               nthreads_ang = 1
-!$             nthreads_ang = omp_get_max_threads()
-               IF (nthreads_ang > 1 .AND. nnp%ang(ind)%n_symfgrp > 1) THEN
+               ! Parallelism now lives in the outer atom loop of
+               ! nnp_calc_energy_force, so the angular kernel runs serially here.
+               ! Always take the inline path: it is the serial reference (what
+               ! master/OMP=1 executes), giving identical FP order at every thread
+               ! count, so the deterministic force fold is the ONLY source of
+               ! thread-count variation. The former inner-OpenMP helper
+               ! (nnp_acsf_angular_loop_omp, now serial) is retained for reference.
+               IF (.FALSE.) THEN
                   IF (PRESENT(stress)) THEN
-                     CALL nnp_acsf_angular_loop_omp(nnp, ind, self_dGdr, off, stress)
+                     CALL nnp_acsf_angular_loop_omp(nnp, ind, self_dGdr, off, ang_y, stress)
                   ELSE
-                     CALL nnp_acsf_angular_loop_omp(nnp, ind, self_dGdr, off)
+                     CALL nnp_acsf_angular_loop_omp(nnp, ind, self_dGdr, off, ang_y)
                   END IF
                ELSE
                   DO s = 1, nnp%ang(ind)%n_symfgrp
@@ -335,7 +352,7 @@ CONTAINS
 
                                     symtmp_il = EXP(-eta_il*r2sum_il)
                                     sym_il = prefzeta_il*angular_il*symtmp_il*ftot_il
-                                    nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + sym_il
+                                    ang_y(m - off) = ang_y(m - off) + sym_il
 
                                     pref_lam_il = zeta_il*tmpzeta_il*lam_il*inv_g2_il
                                     tmp_il = -2.0_dp*symtmp_il*eta_il
@@ -458,7 +475,7 @@ CONTAINS
 
                                     symtmp_il = EXP(-eta_il*r2sum_il)
                                     sym_il = prefzeta_il*angular_il*symtmp_il*ftot_il
-                                    nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + sym_il
+                                    ang_y(m - off) = ang_y(m - off) + sym_il
 
                                     pref_lam_il = zeta_il*tmpzeta_il*lam_il*inv_g2_il
                                     tmp_il = -2.0_dp*symtmp_il*eta_il
@@ -509,7 +526,7 @@ CONTAINS
                      CALL nnp_calc_rad(nnp, ind, s, rvect1, r1, radial_symtmp(1:nnp%rad(ind)%symfgrp(s)%n_symf))
                      DO sf = 1, nnp%rad(ind)%symfgrp(s)%n_symf
                         m = nnp%rad(ind)%symfgrp(s)%symf(sf)
-                        nnp%rad(ind)%y(m) = nnp%rad(ind)%y(m) + radial_symtmp(sf)
+                        rad_y(m) = rad_y(m) + radial_symtmp(sf)
                      END DO
                   END DO
                END DO
@@ -546,7 +563,7 @@ CONTAINS
                                                 angular_symtmp(1:n_symf_s))
                               DO sf = 1, n_symf_s
                                  m = off + nnp%ang(ind)%symfgrp(s)%symf(sf)
-                                 nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + angular_symtmp(sf)
+                                 ang_y(m - off) = ang_y(m - off) + angular_symtmp(sf)
                               END DO
                            END IF
                         END DO
@@ -574,7 +591,7 @@ CONTAINS
                                                 angular_symtmp(1:n_symf_s))
                               DO sf = 1, n_symf_s
                                  m = off + nnp%ang(ind)%symfgrp(s)%symf(sf)
-                                 nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + angular_symtmp(sf)
+                                 ang_y(m - off) = ang_y(m - off) + angular_symtmp(sf)
                               END DO
                            END IF
                         END DO
@@ -591,13 +608,15 @@ CONTAINS
       END ASSOCIATE
 
       !check extrapolation
-      CALL nnp_check_extrapolation(nnp, ind)
+      CALL nnp_check_extrapolation(nnp, ind, rad_y, ang_y)
 
       IF (PRESENT(stress)) THEN
-         CALL nnp_scale_acsf(nnp, ind, do_forces, stress)
+         CALL nnp_scale_acsf(nnp, ind, do_forces, arc, rad_y, ang_y, stress)
       ELSE
-         CALL nnp_scale_acsf(nnp, ind, do_forces)
+         CALL nnp_scale_acsf(nnp, ind, do_forces, arc, rad_y, ang_y)
       END IF
+
+      DEALLOCATE (rad_y, ang_y)
 
       CALL timestop(handle)
 
@@ -682,17 +701,18 @@ CONTAINS
 !> \param off ...
 !> \param stress ...
 ! **************************************************************************************************
-   SUBROUTINE nnp_acsf_angular_loop_omp(nnp, ind, self_dGdr, off, stress)
+   SUBROUTINE nnp_acsf_angular_loop_omp(nnp, ind, self_dGdr, off, ang_y, stress)
       TYPE(nnp_type), INTENT(INOUT), POINTER             :: nnp
       INTEGER, INTENT(IN)                                :: ind
       REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: self_dGdr
       INTEGER, INTENT(IN)                                :: off
+      REAL(KIND=dp), DIMENSION(:), INTENT(INOUT)         :: ang_y
       REAL(KIND=dp), DIMENSION(:, :, :), INTENT(INOUT), &
          OPTIONAL                                        :: stress
 
       INTEGER                                            :: cache_cap_loc, j, k, l, m, &
                                                             max_ang_symf_loc, n_ang1_s, n_ang2_s, &
-                                                            n_symf_s, s, sf
+                                                            n_symf_s, s, sf, tid
       LOGICAL                                            :: homo_grp
       REAL(KIND=dp)                                      :: cutoff_s, cutoff_sqr, r1, r2, r3, r3_sqr
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: dfc_c1_loc, dfc_c2_loc, fc_c1_loc, &
@@ -700,13 +720,15 @@ CONTAINS
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: force_loc
       REAL(KIND=dp), DIMENSION(3)                        :: rvect1, rvect2, rvect3
 
-! Per-thread automatic scratch (see PRIVATE clause below). Sizes
-! are pulled from the pre-sized workspace so they match the peak
-! usage that the serial kernel would allocate into the workspace
-! %fc_cache*/angular_* slabs.
+! Serial angular kernel. The angular symmetry-function GROUP loop used to be
+! threaded here (inner OpenMP); parallelism now lives in the outer atom loop
+! of nnp_calc_energy_force, so this runs serially on each thread's own data.
+! The former PRIVATE scratch arrays are ordinary local allocatables.
 
-      ASSOCIATE (workspace => nnp%neighbor_interface_state%workspace(ind), &
-                 neighbor => nnp%neighbor_interface_state%workspace(ind)%neighbor)
+      tid = 1
+!$    tid = omp_get_thread_num() + 1
+      ASSOCIATE (workspace => nnp%neighbor_interface_state%workspace(ind, tid), &
+                 neighbor => nnp%neighbor_interface_state%workspace(ind, tid)%neighbor)
 
          cache_cap_loc = MAX(1, workspace%cache_cap)
          max_ang_symf_loc = MAX(1, workspace%max_ang_symf)
@@ -742,14 +764,6 @@ CONTAINS
          ! race-free. workspace/neighbor are ASSOCIATE names that inherit the
          ! data-sharing of their nnp selector; the OPTIONAL stress is SHARED and
          ! gated by PRESENT().
-!$OMP PARALLEL DEFAULT(NONE) &
-!$OMP          SHARED(nnp, ind, self_dGdr, off, stress, &
-!$OMP                 cache_cap_loc, max_ang_symf_loc) &
-!$OMP          PRIVATE(s, j, k, sf, m, l, n_symf_s, n_ang1_s, n_ang2_s, &
-!$OMP                  r1, r2, r3, r3_sqr, cutoff_s, cutoff_sqr, homo_grp, &
-!$OMP                  rvect1, rvect2, rvect3, &
-!$OMP                  fc_c1_loc, dfc_c1_loc, fc_c2_loc, dfc_c2_loc, &
-!$OMP                  sym_loc, force_loc)
          ALLOCATE (fc_c1_loc(cache_cap_loc))
          ALLOCATE (dfc_c1_loc(cache_cap_loc))
          ALLOCATE (fc_c2_loc(cache_cap_loc))
@@ -757,7 +771,6 @@ CONTAINS
          ALLOCATE (sym_loc(max_ang_symf_loc))
          ALLOCATE (force_loc(3, 3, max_ang_symf_loc))
 
-!$OMP DO SCHEDULE(dynamic)
          DO s = 1, nnp%ang(ind)%n_symfgrp
             cutoff_s = nnp%ang(ind)%symfgrp(s)%cutoff
             cutoff_sqr = cutoff_s*cutoff_s
@@ -804,7 +817,7 @@ CONTAINS
                                  stress(:, l, m) = stress(:, l, m) - rvect2(:)*force_loc(l, 3, sf)
                               END DO
                            END IF
-                           nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + sym_loc(sf)
+                           ang_y(m - off) = ang_y(m - off) + sym_loc(sf)
                         END DO
                      END IF
                   END DO
@@ -849,17 +862,15 @@ CONTAINS
                                  stress(:, l, m) = stress(:, l, m) - rvect2(:)*force_loc(l, 3, sf)
                               END DO
                            END IF
-                           nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + sym_loc(sf)
+                           ang_y(m - off) = ang_y(m - off) + sym_loc(sf)
                         END DO
                      END IF
                   END DO
                END DO
             END IF
          END DO
-!$OMP END DO
 
          DEALLOCATE (fc_c1_loc, dfc_c1_loc, fc_c2_loc, dfc_c2_loc, sym_loc, force_loc)
-!$OMP END PARALLEL
 
       END ASSOCIATE
 
@@ -879,10 +890,24 @@ CONTAINS
 
       TYPE(nnp_type), INTENT(INOUT), POINTER             :: nnp
 
+      INTEGER                                            :: ind
+
       IF (.NOT. ALLOCATED(nnp%cell_list_cache)) ALLOCATE (nnp%cell_list_cache)
       IF (.NOT. ALLOCATED(nnp%neighbor_interface_state)) ALLOCATE (nnp%neighbor_interface_state)
       CALL nnp_prepare_cell_list_cache(nnp)
       CALL nnp_neighbor_interface_prepare(nnp)
+
+      ! Build the radial spline tables here, serially, before the (possibly
+      ! atom-level-threaded) per-atom loop. The lazy first-touch build inside
+      ! nnp_calc_acsf would otherwise race across threads on the first step.
+      DO ind = 1, nnp%n_ele
+         IF (nnp%rad(ind)%n_symfgrp > 0) THEN
+            IF (.NOT. nnp%rad(ind)%symfgrp(1)%spline_built) THEN
+               CALL nnp_build_radial_splines(nnp)
+               EXIT
+            END IF
+         END IF
+      END DO
 
    END SUBROUTINE nnp_prepare_neighbor_cache
 
@@ -893,34 +918,38 @@ CONTAINS
 !> \date   2020-10-10
 !> \author Christoph Schran (christoph.schran@rub.de)
 ! **************************************************************************************************
-   SUBROUTINE nnp_check_extrapolation(nnp, ind)
+   SUBROUTINE nnp_check_extrapolation(nnp, ind, rad_y, ang_y)
 
       TYPE(nnp_type), INTENT(INOUT)                      :: nnp
       INTEGER, INTENT(IN)                                :: ind
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: rad_y, ang_y
 
       REAL(KIND=dp), PARAMETER                           :: threshold = 0.0001_dp
 
       INTEGER                                            :: j
       LOGICAL                                            :: extrapolate
 
-      extrapolate = nnp%output_expol
+      extrapolate = .FALSE.
 
       DO j = 1, nnp%n_rad(ind)
-         IF (nnp%rad(ind)%y(j) - nnp%rad(ind)%loc_max(j) > threshold) THEN
+         IF (rad_y(j) - nnp%rad(ind)%loc_max(j) > threshold) THEN
             extrapolate = .TRUE.
-         ELSE IF (-nnp%rad(ind)%y(j) + nnp%rad(ind)%loc_min(j) > threshold) THEN
+         ELSE IF (-rad_y(j) + nnp%rad(ind)%loc_min(j) > threshold) THEN
             extrapolate = .TRUE.
          END IF
       END DO
       DO j = 1, nnp%n_ang(ind)
-         IF (nnp%ang(ind)%y(j) - nnp%ang(ind)%loc_max(j) > threshold) THEN
+         IF (ang_y(j) - nnp%ang(ind)%loc_max(j) > threshold) THEN
             extrapolate = .TRUE.
-         ELSE IF (-nnp%ang(ind)%y(j) + nnp%ang(ind)%loc_min(j) > threshold) THEN
+         ELSE IF (-ang_y(j) + nnp%ang(ind)%loc_min(j) > threshold) THEN
             extrapolate = .TRUE.
          END IF
       END DO
 
-      nnp%output_expol = extrapolate
+      ! Write-only monotonic flag: many threads may set it .TRUE. concurrently
+      ! (identical value, benign race); it is reset to .FALSE. once, serially,
+      ! before the atom loop in nnp_calc_energy_force.
+      IF (extrapolate) nnp%output_expol = .TRUE.
 
    END SUBROUTINE nnp_check_extrapolation
 
@@ -933,70 +962,76 @@ CONTAINS
 !> \date   2020-10-10
 !> \author Christoph Schran (christoph.schran@rub.de)
 ! **************************************************************************************************
-   SUBROUTINE nnp_scale_acsf(nnp, ind, do_forces, stress)
+   SUBROUTINE nnp_scale_acsf(nnp, ind, do_forces, arc, rad_y, ang_y, stress)
 
       TYPE(nnp_type), INTENT(INOUT)                      :: nnp
       INTEGER, INTENT(IN)                                :: ind
       LOGICAL, INTENT(IN)                                :: do_forces
+      ! Thread-private network clone + SF accumulators supplied by the caller.
+      TYPE(nnp_arc_type), INTENT(INOUT)                  :: arc
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: rad_y, ang_y
       REAL(KIND=dp), DIMENSION(:, :, :), INTENT(INOUT), &
          OPTIONAL                                        :: stress
 
       INTEGER                                            :: j, k, m, n_ang1_s, n_ang2_s, n_symf_s, &
-                                                            off, s, sf
+                                                            off, s, sf, tid
       LOGICAL                                            :: homo_grp
       REAL(KIND=dp)                                      :: scale
+
+      tid = 1
+!$    tid = omp_get_thread_num() + 1
 
 ! INOUT (not OUT): stress is per-input-node and accumulates across central atoms.
 
       IF (nnp%center_acsf) THEN
          DO j = 1, nnp%n_rad(ind)
-            nnp%arc(ind)%layer(1)%node(j) = nnp%rad(ind)%y(j) - nnp%rad(ind)%loc_av(j)
+            arc%layer(1)%node(j) = rad_y(j) - nnp%rad(ind)%loc_av(j)
          END DO
          off = nnp%n_rad(ind)
          DO j = 1, nnp%n_ang(ind)
-            nnp%arc(ind)%layer(1)%node(j + off) = nnp%ang(ind)%y(j) - nnp%ang(ind)%loc_av(j)
+            arc%layer(1)%node(j + off) = ang_y(j) - nnp%ang(ind)%loc_av(j)
          END DO
 
          IF (nnp%scale_acsf) THEN
             DO j = 1, nnp%n_rad(ind)
-               nnp%arc(ind)%layer(1)%node(j) = nnp%arc(ind)%layer(1)%node(j)/ &
+               arc%layer(1)%node(j) = arc%layer(1)%node(j)/ &
                                              (nnp%rad(ind)%loc_max(j) - nnp%rad(ind)%loc_min(j))*(nnp%scmax - nnp%scmin) + nnp%scmin
             END DO
             off = nnp%n_rad(ind)
             DO j = 1, nnp%n_ang(ind)
-               nnp%arc(ind)%layer(1)%node(j + off) = nnp%arc(ind)%layer(1)%node(j + off)/ &
+               arc%layer(1)%node(j + off) = arc%layer(1)%node(j + off)/ &
                                              (nnp%ang(ind)%loc_max(j) - nnp%ang(ind)%loc_min(j))*(nnp%scmax - nnp%scmin) + nnp%scmin
             END DO
          END IF
       ELSE IF (nnp%scale_acsf) THEN
          DO j = 1, nnp%n_rad(ind)
-            nnp%arc(ind)%layer(1)%node(j) = (nnp%rad(ind)%y(j) - nnp%rad(ind)%loc_min(j))/ &
+            arc%layer(1)%node(j) = (rad_y(j) - nnp%rad(ind)%loc_min(j))/ &
                                             (nnp%rad(ind)%loc_max(j) - nnp%rad(ind)%loc_min(j))* &
                                             (nnp%scmax - nnp%scmin) + nnp%scmin
          END DO
          off = nnp%n_rad(ind)
          DO j = 1, nnp%n_ang(ind)
-            nnp%arc(ind)%layer(1)%node(j + off) = (nnp%ang(ind)%y(j) - nnp%ang(ind)%loc_min(j))/ &
+            arc%layer(1)%node(j + off) = (ang_y(j) - nnp%ang(ind)%loc_min(j))/ &
                                                   (nnp%ang(ind)%loc_max(j) - nnp%ang(ind)%loc_min(j))* &
                                                   (nnp%scmax - nnp%scmin) + nnp%scmin
          END DO
       ELSE IF (nnp%scale_sigma_acsf) THEN
          DO j = 1, nnp%n_rad(ind)
-            nnp%arc(ind)%layer(1)%node(j) = (nnp%rad(ind)%y(j) - nnp%rad(ind)%loc_av(j))/ &
+            arc%layer(1)%node(j) = (rad_y(j) - nnp%rad(ind)%loc_av(j))/ &
                                             nnp%rad(ind)%sigma(j)*(nnp%scmax - nnp%scmin) + nnp%scmin
          END DO
          off = nnp%n_rad(ind)
          DO j = 1, nnp%n_ang(ind)
-            nnp%arc(ind)%layer(1)%node(j + off) = (nnp%ang(ind)%y(j) - nnp%ang(ind)%loc_av(j))/ &
+            arc%layer(1)%node(j + off) = (ang_y(j) - nnp%ang(ind)%loc_av(j))/ &
                                                   nnp%ang(ind)%sigma(j)*(nnp%scmax - nnp%scmin) + nnp%scmin
          END DO
       ELSE
          DO j = 1, nnp%n_rad(ind)
-            nnp%arc(ind)%layer(1)%node(j) = nnp%rad(ind)%y(j)
+            arc%layer(1)%node(j) = rad_y(j)
          END DO
          off = nnp%n_rad(ind)
          DO j = 1, nnp%n_ang(ind)
-            nnp%arc(ind)%layer(1)%node(j + off) = nnp%ang(ind)%y(j)
+            arc%layer(1)%node(j + off) = ang_y(j)
          END DO
       END IF
 
@@ -1006,9 +1041,9 @@ CONTAINS
          ! group s the valid ranges are sf=1..n_symf_s and j=1..n_rad(s)
          ! (radial) or j=1..n_ang1_s, k=1..n_ang2_s (angular). The self
          ! contribution lives in self_dGdr(:, m).
-         ASSOCIATE (workspace => nnp%neighbor_interface_state%workspace(ind), &
-                    neighbor => nnp%neighbor_interface_state%workspace(ind)%neighbor, &
-                    self_dGdr => nnp%neighbor_interface_state%workspace(ind)%self_dGdr)
+         ASSOCIATE (workspace => nnp%neighbor_interface_state%workspace(ind, tid), &
+                    neighbor => nnp%neighbor_interface_state%workspace(ind, tid)%neighbor, &
+                    self_dGdr => nnp%neighbor_interface_state%workspace(ind, tid)%self_dGdr)
 
             ! Radial groups
             DO s = 1, nnp%rad(ind)%n_symfgrp
