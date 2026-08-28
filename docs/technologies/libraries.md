@@ -62,6 +62,12 @@ CP2K assumes that the MPI library implements MPI version 3; older versions of MP
 are not supported. CP2K can make use of the `mpi_f08` module; pass `-DCP2K_USE_MPI_F08=ON` to CMake
 to enable it.
 
+From version 2027.1, CP2K also requires the MPI implementation to provide `MPI_THREAD_MULTIPLE`. The
+standalone executables request this level when initializing MPI and stop if it is unavailable. When
+CP2K is used as a library in an application that initializes MPI externally, the application must
+call `MPI_Init_thread` requesting `MPI_THREAD_MULTIPLE`; initialization through `MPI_Init` or with a
+lower thread-support level is insufficient.
+
 For more information of ScaLAPACK, see <http://www.netlib.org/scalapack/>. ScaLAPACK can be part of
 AOCL (AMD) or oneMKL (Intel); these libraries are recommended on the corresponding machines if
 available.
@@ -154,9 +160,9 @@ integrator.
 - Pass `-DCP2K_USE_GAUXC=ON` to CMake to enable GauXC. An MPI-enabled CP2K build requires a GauXC
   installation built with MPI support.
 - TorchScript-based GauXC models require a libtorch installation compatible with CP2K's BLAS and
-  OpenMP runtime. Pre-built libtorch bundles can conflict with a CP2K build using oneMKL; use a
-  compatible generic BLAS stack or rebuild libtorch against the selected dynamic stack when this
-  occurs.
+  OpenMP runtime. Pre-built libtorch bundles commonly include oneMKL. CP2K's LP64 OpenBLAS build
+  provides a compatibility path for the conflicting grouped SGEMM/DGEMM symbols; other mixed BLAS
+  interfaces require a consistently built numerical stack.
 - See [](../methods/dft/gauxc) for input, supported calculation types, and current limitations.
 
 ## PEXSI (low scaling SCF method)
@@ -266,6 +272,22 @@ potentials support can be enabled by passing `-DCP2K_USE_ACE=ON` to CMake.
   all three libraries (libpace, libyaml-cpp-pace and libcnpy). Access to ML-PACE/ace
   ML-PACE/ace-evaluator and yaml-cpp/include from the library is also needed (see toolchain for
   example).
+
+## symmetrix (torch-free MACE interatomic potentials)
+
+[symmetrix](https://github.com/wcwitt/symmetrix) is a torch-free C++/Kokkos evaluator for MACE
+models. Support is enabled by passing `-DCP2K_USE_SYMMETRIX=ON` to CMake and pointing it at a
+separately built libsymmetrix checkout:
+
+- `-DCP2K_SYMMETRIX_ROOT=<dir>` points at the symmetrix checkout; the bundled `FindSymmetrix` module
+  derives the include directories and static libraries from it (and its build tree,
+  `-DCP2K_SYMMETRIX_BUILD_DIR=<dir>`, default `<ROOT>/build`).
+- `-DCP2K_SYMMETRIX_KOKKOS=ON` links the Kokkos (GPU) evaluator (needs a Kokkos-enabled
+  `libsymmetrix` and CUDA ≥ 12.2).
+- `-DCP2K_SYMMETRIX_INCLUDE_DIR=<dir>` / `-DCP2K_SYMMETRIX_LIBRARIES="<...>.a;<...>.a"` remain as an
+  explicit escape hatch that bypasses the find module.
+- symmetrix requires C++20 and the GNU libstdc++ special functions. See
+  [](../methods/machine_learning/symmetrix) for usage.
 
 ## DFTD4 (dispersion correction)
 

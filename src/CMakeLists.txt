@@ -91,6 +91,7 @@ list(
   constraint_fxd.F
   constraint_util.F
   constraint_vsite.F
+  integral_library_types.F
   greenx_interface.F
   core_ae.F
   core_ppl.F
@@ -199,6 +200,7 @@ list(
   fist_nonbond_force.F
   fist_pol_scf.F
   floquet_main.F
+  floquet_types.F
   floquet_utils.F
   force_env_methods.F
   force_env_types.F
@@ -327,6 +329,7 @@ list(
   kpoint_coulomb_2c.F
   kpoint_io.F
   kpoint_k_r_trafo_simple.F
+  kpoint_lattice_fft.F
   kpoint_methods.F
   kpoint_mo_dump.F
   kpoint_mo_symmetry_methods.F
@@ -335,6 +338,7 @@ list(
   kpsym.F
   libgrpp_integrals.F
   libint_2c_3c.F
+  coulomb_integral_interface.F
   libint_wrapper.F
   libgint_wrapper.F
   library_tests.F
@@ -357,6 +361,10 @@ list(
   manybody_gal.F
   manybody_e3nn.F
   manybody_potential.F
+  manybody_mlp_celllist.F
+  manybody_mlp_neighbor.F
+  manybody_mlp_partition.F
+  manybody_symmetrix.F
   manybody_siepmann.F
   manybody_tersoff.F
   manybody_ace.F
@@ -373,6 +381,7 @@ list(
   metadynamics_utils.F
   metadyn_tools/graph_methods.F
   metadyn_tools/graph_utils.F
+  symmetrix_api.F
   min_basis_set.F
   minbas_methods.F
   minbas_wfn_analysis.F
@@ -533,6 +542,7 @@ list(
   qs_basis_gradient.F
   qs_basis_rotation_methods.F
   qs_block_davidson_types.F
+  qs_cdft_grid.F
   qs_cdft_methods.F
   qs_cdft_opt_types.F
   qs_cdft_scf_utils.F
@@ -565,6 +575,9 @@ list(
   qs_dftb_utils.F
   qs_diis.F
   qs_diis_types.F
+  qs_scf_subspace_types.F
+  qs_scf_subspace_math.F
+  qs_scf_subspace.F
   qs_dispersion_nonloc.F
   qs_dispersion_d2.F
   qs_dispersion_d3.F
@@ -608,6 +621,7 @@ list(
   qs_force.F
   qs_force_types.F
   qs_fxc.F
+  qs_fgxc.F
   qs_gamma2kp.F
   qs_gapw_densities.F
   qs_gcp_method.F
@@ -617,6 +631,7 @@ list(
   qs_gspace_mixing.F
   qs_harris_types.F
   qs_harris_utils.F
+  qs_harris_methods.F
   qs_harmonics_atom.F
   qs_hash_table_functions.F
   qs_initial_guess.F
@@ -884,6 +899,7 @@ list(
   xas_tdp_types.F
   xas_tdp_utils.F
   xas_tp_scf.F
+  gapw_gspace_reconstruction.F
   xray_diffraction.F
   xtb_qresp.F
   xtb_coulomb.F
@@ -1070,6 +1086,7 @@ list(
   fm/cp_cfm_basic_linalg.F
   fm/cp_cfm_diag.F
   fm/cp_cfm_basic_linalg.F
+  fm/cp_cfm_elpa.F
   fm/cp_cfm_types.F
   fm/cp_fm_basic_linalg.F
   fm/cp_fm_cholesky.F
@@ -1510,7 +1527,36 @@ list(APPEND CP2K_SRCS_F grpp/libgrpp.F)
 
 set(CP2K_FPGA_SRC_C pw/fpga/fft_fpga.c pw/fpga/opencl_utils.c)
 set(CP2K_PW_SRCS_C pw/gpu/pw_gpu_internal.c)
-set(CP2K_SRCS_CPP torch_c_api.cpp ace_c_api.cpp)
+# symmetrix has no torch dependency; its C glue compiles in-tree and links
+# libsymmetrix.a (+ sphericart + BLAS) given via CP2K_SYMMETRIX_LIBRARIES.
+# Listed unconditionally (the file is a no-op without __SYMMETRIX) so that the
+# source consistency check sees every .cpp in src/ regardless of the enabled
+# options.
+set(CP2K_SRCS_CPP torch_c_api.cpp ace_c_api.cpp symmetrix_c_api.cpp)
+if(CP2K_USE_SYMMETRIX)
+  # With CP2K_SYMMETRIX_KOKKOS=ON, symmetrix_c_api.cpp includes mace_kokkos.hpp
+  # -> Kokkos device headers that hard-error unless compiled by nvcc (they
+  # require __CUDACC__). Compile just this TU as CUDA, with the Kokkos nvcc
+  # flags (relaxed constexpr + extended lambda). This is independent of
+  # CP2K_USE_ACCEL: the GPU work lives inside libsymmetrix/Kokkos, so the Kokkos
+  # build works with CP2K's own accelerator layer off (the top-level CMakeLists
+  # enables the CUDA language for this case).
+  if(CP2K_SYMMETRIX_KOKKOS)
+    set_source_files_properties(
+      symmetrix_c_api.cpp
+      PROPERTIES
+        LANGUAGE CUDA
+        COMPILE_OPTIONS
+        "--expt-relaxed-constexpr;--extended-lambda;-Xcompiler=-fopenmp;-Xcompiler=-fvisibility-inlines-hidden"
+    )
+  elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # Keep this TU's inline C++ template instantiations out of libcp2k.so's
+    # dynamic symbol table; only the extern "C" entry points are needed.
+    set_source_files_properties(
+      symmetrix_c_api.cpp PROPERTIES COMPILE_OPTIONS
+                                     "-fvisibility-inlines-hidden")
+  endif()
+endif()
 
 list(APPEND CP2K_SRCS_C "${CP2K_OFFLOAD_SRCS_C}" "${CP2K_MPIWRAP_SRCS_C}")
 
@@ -1540,12 +1586,21 @@ set(CP2K_PROGS_F
     common/gemm_square_unittest.F
     common/memory_utilities_unittest.F
     common/parallel_rng_types_unittest.F
+    kpoint_lattice_fft_unittest.F
+    qs_charge_mixing_unittest.F
+    subsys/cell_types_unittest.F
     pw/realspace_grid_cube_unittest.F
     metadyn_tools/graph.F
     motion/dumpdcd.F
     motion/xyz2dcd.F
     nequip_unittest.F
     gx_ac_unittest.F)
+
+if(CP2K_USE_MPI)
+  list(APPEND CP2K_PROGS_F mpiwrap/message_passing_thread_unittest.F)
+else()
+  list(APPEND CP2K_EXCLUDED_SRCS_F mpiwrap/message_passing_thread_unittest.F)
+endif()
 
 if(CP2K_USE_CUDA
    OR CP2K_USE_HIP
@@ -1724,6 +1779,39 @@ endif()
 target_compile_features(cp2k PUBLIC cuda_std_11)
 target_include_directories(cp2k PUBLIC $<INSTALL_INTERFACE:include/cp2k>)
 
+# symmetrix_c_api.cpp includes libsymmetrix's mace.hpp
+if(CP2K_USE_SYMMETRIX AND CP2K_SYMMETRIX_INCLUDE_DIR)
+  target_include_directories(cp2k PRIVATE ${CP2K_SYMMETRIX_INCLUDE_DIR})
+endif()
+
+# The static archives behind the symmetrix backend (Kokkos in particular)
+# contribute hundreds of weak C++ template instantiations to libcp2k.so's
+# dynamic symbol table (e.g. std::__cxx11::regex_traits from Kokkos' libstdc++
+# headers). When libtorch is also linked (e.g. the nequip backend via
+# CP2K_USE_LIBTORCH), those exported symbols interpose the copies inside
+# libtorch — which may be built against a different libstdc++ (dual-ABI) — and
+# the mixed std::regex machinery corrupts the heap on the first model load.
+# Nothing outside libcp2k needs these archives' symbols (the backend surface is
+# the extern "C" API in symmetrix_c_api.cpp), so keep them local to the shared
+# library.
+if(CP2K_USE_SYMMETRIX
+   AND BUILD_SHARED_LIBS
+   AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(CP2K_SYMMETRIX_EXCLUDE_LIBS "")
+  foreach(_sym_lib IN LISTS CP2K_SYMMETRIX_LIBRARIES)
+    if(_sym_lib MATCHES "\\.a$")
+      get_filename_component(_sym_lib_name "${_sym_lib}" NAME)
+      list(APPEND CP2K_SYMMETRIX_EXCLUDE_LIBS "${_sym_lib_name}")
+    endif()
+  endforeach()
+  if(CP2K_SYMMETRIX_EXCLUDE_LIBS)
+    list(JOIN CP2K_SYMMETRIX_EXCLUDE_LIBS ":" _sym_exclude_arg)
+    target_link_options(cp2k PRIVATE
+                        "LINKER:--exclude-libs=${_sym_exclude_arg}")
+    unset(_sym_exclude_arg)
+  endif()
+endif()
+
 if(TARGET cp2k_dbm_opencl_kernel)
   add_dependencies(cp2k cp2k_dbm_opencl_kernel)
 endif()
@@ -1782,7 +1870,7 @@ target_link_libraries(
     $<$<BOOL:${CP2K_USE_ACE}>:pace::pace>
     $<$<BOOL:${CP2K_USE_TBLITE}>:cp2k::tblite>
     $<$<BOOL:${CP2K_USE_TBLITE}>:s-dftd3::s-dftd3>
-    $<$<BOOL:${CP2K_USE_SIRIUS}>:sirius::sirius>
+    $<$<BOOL:${CP2K_USE_SIRIUS}>:cp2k::sirius>
     $<$<BOOL:${CP2K_USE_VORI}>:cp2k::VORI::vori>
     $<$<BOOL:${CP2K_USE_SPGLIB}>:Spglib::symspg>
     $<$<BOOL:${CP2K_USE_LIBSMEAGOL}>:cp2k::libsmeagol::smeagol>
@@ -1810,6 +1898,8 @@ target_link_libraries(
     cp2k_linalg_libs
     # Torch includes some LAPACK routines, but with floating-point exceptions.
     $<$<BOOL:${CP2K_USE_LIBTORCH}>:${TORCH_LIBRARIES}>
+    # symmetrix: libsymmetrix.a + sphericart + BLAS (no torch).
+    $<$<BOOL:${CP2K_USE_SYMMETRIX}>:${CP2K_SYMMETRIX_LIBRARIES}>
     $<$<BOOL:${CP2K_USE_OPENPMD}>:openPMD::openPMD>
     $<$<AND:$<CONFIG:COVERAGE>,$<Fortran_COMPILER_ID:GNU>>:gcov>)
 
@@ -1859,6 +1949,9 @@ target_compile_definitions(
     $<$<BOOL:${CP2K_USE_SIRIUS}>:__SIRIUS>
     $<$<BOOL:${CP2K_USE_LIBVDWXC}>:__LIBVDWXC>
     $<$<BOOL:${CP2K_USE_GAUXC}>:__GAUXC>
+    # GauXC's CMake package exports CUTLASS even when its Fortran config does
+    # not.
+    $<$<AND:$<BOOL:${CP2K_USE_GAUXC}>,$<BOOL:${GAUXC_HAS_CUTLASS}>>:GAUXC_HAS_CUTLASS>
     # GauXC feature flags GAUXC_HAS_MPI, GAUXC_HAS_ONEDFT, GAUXC_HAS_HOST,
     # GAUXC_HAS_DEVICE, GAUXC_HAS_CUDA, and GAUXC_HAS_HDF5 are provided by
     # gauxc/gauxc_config.f in the Fortran sources.
@@ -1876,6 +1969,9 @@ target_compile_definitions(
     $<$<BOOL:${CP2K_USE_LIBGINT}>:__LIBGINT>
     $<$<BOOL:${CP2K_USE_LIBFCI}>:__LIBFCI>
     $<$<BOOL:${CP2K_USE_LIBTORCH}>:__LIBTORCH>
+    $<$<BOOL:${CP2K_USE_LIBTORCH_CUDA}>:__LIBTORCH_CUDA>
+    $<$<BOOL:${CP2K_USE_SYMMETRIX}>:__SYMMETRIX>
+    $<$<AND:$<BOOL:${CP2K_USE_SYMMETRIX}>,$<BOOL:${CP2K_SYMMETRIX_KOKKOS}>>:__SYMMETRIX_KOKKOS>
     $<$<BOOL:${CP2K_USE_COSMA}>:__COSMA>
     $<$<BOOL:${CP2K_USE_LIBXS}>:__LIBXS>
     $<$<BOOL:${CP2K_USE_LIBXS}>:__BLAS>
@@ -1890,6 +1986,7 @@ target_compile_definitions(
     $<$<STREQUAL:"${CP2K_BLAS_VENDOR}","Apple">:__ACCELERATE>
     $<$<BOOL:${CP2K_USE_CUSOLVER_MP}>:__CUSOLVERMP>
     $<$<BOOL:${CP2K_CUSOLVERMP_USE_NCCL}>:__CUSOLVERMP_NCCL>
+    $<$<AND:$<STREQUAL:"${CP2K_BLAS_VENDOR}","OpenBLAS">,$<STREQUAL:"${CP2K_BLAS_INTERFACE}","32bits">>:__OPENBLAS>
     $<$<BOOL:${CP2K_USE_CRAY_PM_ENERGY}>:__CRAY_PM_ENERGY>
     $<$<BOOL:${CP2K_USE_CRAY_PM_ACCEL_ENERGY}>:__CRAY_PM_ACCEL_ENERGY>
     ${CP2K_GPU_DFLAGS})
@@ -1935,6 +2032,9 @@ list(
   "gemm_square_unittest"
   "memory_utilities_unittest"
   "parallel_rng_types_unittest"
+  "kpoint_lattice_fft_unittest"
+  "qs_charge_mixing_unittest"
+  "cell_types_unittest"
   "realspace_grid_cube_unittest"
   "graph"
   "dumpdcd"
@@ -1945,6 +2045,10 @@ list(
   "dbt_tas_unittest"
   "gx_ac_unittest")
 
+if(CP2K_USE_MPI)
+  list(APPEND __CP2K_APPS "message_passing_thread_unittest")
+endif()
+
 add_executable(cp2k-bin start/cp2k.F)
 # for linking
 
@@ -1953,6 +2057,9 @@ add_executable(orbital_transformation_matrices_unittest
 add_executable(gemm_square_unittest common/gemm_square_unittest.F)
 add_executable(memory_utilities_unittest common/memory_utilities_unittest.F)
 add_executable(parallel_rng_types_unittest common/parallel_rng_types_unittest.F)
+add_executable(kpoint_lattice_fft_unittest kpoint_lattice_fft_unittest.F)
+add_executable(qs_charge_mixing_unittest qs_charge_mixing_unittest.F)
+add_executable(cell_types_unittest subsys/cell_types_unittest.F)
 add_executable(realspace_grid_cube_unittest pw/realspace_grid_cube_unittest.F)
 add_executable(graph metadyn_tools/graph.F)
 add_executable(dumpdcd motion/dumpdcd.F)
@@ -1962,6 +2069,10 @@ add_executable(nequip_unittest nequip_unittest.F)
 add_executable(dbt_unittest dbt/dbt_unittest.F)
 add_executable(dbt_tas_unittest dbt/tas/dbt_tas_unittest.F)
 add_executable(gx_ac_unittest gx_ac_unittest.F)
+if(CP2K_USE_MPI)
+  add_executable(message_passing_thread_unittest
+                 mpiwrap/message_passing_thread_unittest.F)
+endif()
 
 set_target_properties(
   cp2k-bin

@@ -50,9 +50,7 @@ MODULE qs_environment
                                               cp_logger_get_default_io_unit,&
                                               cp_logger_type,&
                                               cp_to_string
-   USE cp_output_handling,              ONLY: cp_p_file,&
-                                              cp_print_key_finished_output,&
-                                              cp_print_key_should_output,&
+   USE cp_output_handling,              ONLY: cp_print_key_finished_output,&
                                               cp_print_key_unit_nr
    USE cp_subsys_types,                 ONLY: cp_subsys_type
    USE cp_symmetry,                     ONLY: write_symmetry
@@ -224,7 +222,9 @@ MODULE qs_environment
                                               xtb_spinpol_init
    USE xtb_potentials,                  ONLY: xtb_pp_radius
    USE xtb_types,                       ONLY: allocate_xtb_atom_param,&
-                                              set_xtb_atom_param
+                                              get_xtb_atom_param,&
+                                              set_xtb_atom_param,&
+                                              write_xtb_atom_param
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -315,6 +315,7 @@ CONTAINS
       IF (.NOT. ASSOCIATED(subsys_section)) THEN
          subsys_section => section_vals_get_subs_vals(force_env_section, "SUBSYS")
       END IF
+      CALL section_vals_val_get(force_env_section, "DFT%QS%METHOD", i_val=method_id)
 
       ! QMMM
       my_qmmm = .FALSE.
@@ -324,14 +325,14 @@ CONTAINS
          IF (qmmm_env_qm%qmmm_coupl_type == do_qmmm_gauss .OR. &
              qmmm_env_qm%qmmm_coupl_type == do_qmmm_swave) THEN
             ! For GAUSS/SWAVE methods there could be a DDAPC decoupling requested
-            qmmm_decoupl = my_qmmm .AND. qmmm_env_qm%periodic .AND. qmmm_env_qm%multipole
+            qmmm_decoupl = my_qmmm .AND. qmmm_env_qm%periodic .AND. qmmm_env_qm%multipole .AND. &
+                           method_id /= do_method_dftb .AND. method_id /= do_method_xtb
          END IF
          qs_env%qmmm_env_qm => qmmm_env_qm
       END IF
       CALL set_qs_env(qs_env=qs_env, qmmm=my_qmmm)
 
       ! Possibly initialize arrays for SE
-      CALL section_vals_val_get(force_env_section, "DFT%QS%METHOD", i_val=method_id)
       SELECT CASE (method_id)
       CASE (do_method_rm1, do_method_am1, do_method_mndo, do_method_pdg, &
             do_method_pm3, do_method_pm6, do_method_pm6fm, do_method_mndod, do_method_pnnl)
@@ -532,7 +533,9 @@ CONTAINS
       END IF
 
       IF (my_qmmm .AND. PRESENT(qmmm_env_qm) .AND. .NOT. dft_control%qs_control%commensurate_mgrids) THEN
-         IF (qmmm_env_qm%qmmm_coupl_type == do_qmmm_gauss .OR. qmmm_env_qm%qmmm_coupl_type == do_qmmm_swave) THEN
+         IF ((qmmm_env_qm%qmmm_coupl_type == do_qmmm_gauss .OR. &
+              qmmm_env_qm%qmmm_coupl_type == do_qmmm_swave) .AND. &
+             method_id /= do_method_dftb .AND. method_id /= do_method_xtb) THEN
             CALL cp_abort(__LOCATION__, "QM/MM with coupling GAUSS or S-WAVE requires "// &
                           "keyword FORCE_EVAL/DFT/MGRID/COMMENSURATE to be enabled.")
          END IF
@@ -998,7 +1001,7 @@ CONTAINS
          nelectron, ngauss, nkind, nlumo_dos, nlumo_molden, nlumo_required, output_unit, &
          sort_basis, tnadd_method
       INTEGER, DIMENSION(2)                              :: n_mo, nelectron_spin
-      INTEGER, DIMENSION(5)                              :: occ
+      INTEGER, DIMENSION(5)                              :: ngaussflex, occ
       INTEGER, DIMENSION(:), POINTER                     :: mo_index_range
       LOGICAL :: all_potential_present, be_silent, cneo_potential_present, do_kpoints, do_ri_hfx, &
          do_ri_mp2, do_ri_rpa, do_ri_sos_mp2, do_rpa_ri_exx, do_wfc_im_time, e1terms, &
@@ -1258,7 +1261,12 @@ CONTAINS
                   ngauss = xtb_control%sto_ng
                END IF
                IF (qs_kind%xtb_parameter%defined) THEN
-                  CALL init_xtb_basis(qs_kind%xtb_parameter, tmp_basis_set, ngauss)
+                  IF (xtb_control%sto_flex) THEN
+                     CALL get_xtb_atom_param(qs_kind%xtb_parameter, ngauss=ngaussflex)
+                     CALL init_xtb_basis(qs_kind%xtb_parameter, tmp_basis_set, ngauss, ngaussflex)
+                  ELSE
+                     CALL init_xtb_basis(qs_kind%xtb_parameter, tmp_basis_set, ngauss)
+                  END IF
                   CALL add_basis_set_to_container(qs_kind%basis_sets, tmp_basis_set, "ORB")
                ELSE
                   CALL set_qs_kind(qs_kind, ghost=.TRUE.)
@@ -1277,6 +1285,7 @@ CONTAINS
                   CALL set_potential(qs_kind%all_potential, ccore_charge=ccore)
                   qs_kind%xtb_parameter%zeff = qs_kind%xtb_parameter%zeff - zeff_correction
                END IF
+               CALL write_xtb_atom_param(qs_kind%xtb_parameter, gfn_type, subsys_section)
             END DO
             !
             ! set repulsive potential range
@@ -1966,6 +1975,9 @@ CONTAINS
             CASE (xtb_vdw_type_d4)
                dispersion_env%pp_type = vdw_pairpot_dftd4
                dispersion_env%ref_functional = "none"
+               ! GFN0 supplies its EEQ charges directly to D4. GFN1 does not, so propagate the
+               ! common EEQ solver settings for the D4 charge model used in that case.
+               dispersion_env%eeq_sparam = xtb_control%eeq_sparam
                CALL qs_dispersion_pairpot_init(atomic_kind_set, qs_kind_set, &
                                                dispersion_env, para_env=para_env)
                dispersion_env%cnfun = 2
@@ -2277,10 +2289,7 @@ CONTAINS
       END IF
 
       ! Some options require that all MOs are computed ...
-      IF (BTEST(cp_print_key_should_output(logger%iter_info, dft_section, &
-                                           "PRINT%MO/CARTESIAN"), &
-                cp_p_file) .OR. &
-          (scf_control%level_shift /= 0.0_dp) .OR. &
+      IF ((scf_control%level_shift /= 0.0_dp) .OR. &
           (scf_control%diagonalization%eps_jacobi /= 0.0_dp) .OR. &
           (dft_control%roks .AND. (.NOT. scf_control%use_ot))) THEN
          n_mo(:) = n_ao

@@ -129,6 +129,23 @@ option(CP2K_USE_LIBFCI "Enable LibFCI active-space solver support"
        ${CP2K_USE_EVERYTHING})
 option(CP2K_USE_LIBINT2 "Enable Libint2 support" ${CP2K_USE_EVERYTHING})
 option(CP2K_USE_LIBTORCH "Enable LibTorch support" ${CP2K_USE_EVERYTHING})
+option(CP2K_USE_SYMMETRIX "Enable symmetrix MACE interatomic potentials" OFF)
+option(
+  CP2K_SYMMETRIX_KOKKOS
+  "Link the Kokkos (GPU) libsymmetrix evaluator (MACEKokkos) instead of the host MACE class"
+  OFF)
+set(CP2K_SYMMETRIX_INCLUDE_DIR
+    ""
+    CACHE
+      PATH
+      "Directory/-ies with the libsymmetrix headers (mace.hpp; mace_kokkos.hpp + Kokkos headers when CP2K_SYMMETRIX_KOKKOS=ON)"
+)
+set(CP2K_SYMMETRIX_LIBRARIES
+    ""
+    CACHE
+      STRING
+      "libsymmetrix and its dependencies to link (e.g. libsymmetrix.a libsphericart.a BLAS; add the Kokkos libs for a Kokkos build)"
+)
 option(CP2K_USE_LIBXC "Enable LibXC support" ${CP2K_USE_EVERYTHING})
 option(CP2K_USE_GAUXC "Enable GauXC support" ${CP2K_USE_EVERYTHING})
 option(CP2K_USE_MPI "Enable MPI support" ${CP2K_USE_EVERYTHING})
@@ -298,6 +315,7 @@ set(CP2K_SUPPORTED_CUDA_ARCHITECTURES
     V100
     A100
     H100
+    B200
     GB10
     A40)
 set(CP2K_SUPPORTED_HIP_ARCHITECTURES
@@ -313,6 +331,7 @@ set(CP2K_SUPPORTED_HIP_ARCHITECTURES
     V100
     A100
     H100
+    B200
     GB10
     A40)
 
@@ -470,6 +489,7 @@ if((CP2K_USE_ACCEL MATCHES CUDA) OR (CP2K_USE_ACCEL MATCHES HIP))
   set(CP2K_GPU_ARCH_NUMBER_V100 70)
   set(CP2K_GPU_ARCH_NUMBER_A100 80)
   set(CP2K_GPU_ARCH_NUMBER_H100 90)
+  set(CP2K_GPU_ARCH_NUMBER_B200 100)
   set(CP2K_GPU_ARCH_NUMBER_GB10 121)
   set(CP2K_GPU_ARCH_NUMBER_A40 86)
   set(CP2K_GPU_ARCH_NUMBER_Mi50 gfx906)
@@ -529,6 +549,9 @@ if((CP2K_USE_ACCEL MATCHES CUDA) OR (CP2K_USE_ACCEL MATCHES HIP))
       set(CMAKE_HIP_ARCHITECTURES "${CP2K_GPU_ARCH_NUMBER_${CP2K_WITH_GPU}}")
     endif()
   endif()
+
+  set(CP2K_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  set(CP2K_HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}")
 endif()
 
 message("\n------------------------------------------------------------")
@@ -903,18 +926,67 @@ endif()
 # SIRIUS
 if(CP2K_USE_SIRIUS)
   find_package(sirius 7.7.0 REQUIRED)
+  add_library(cp2k::sirius INTERFACE IMPORTED)
+  target_link_libraries(cp2k::sirius INTERFACE sirius::sirius)
+
+  get_target_property(CP2K_SIRIUS_LIBRARY_TYPE sirius::sirius TYPE)
+  if(CP2K_SIRIUS_LIBRARY_TYPE STREQUAL "SHARED_LIBRARY")
+    # Shared SIRIUS does not export the private C++ library's link interface.
+    find_package(sirius_cxx CONFIG REQUIRED)
+    target_link_libraries(cp2k::sirius
+                          INTERFACE "$<LINK_ONLY:sirius::sirius_cxx>")
+  endif()
+  unset(CP2K_SIRIUS_LIBRARY_TYPE)
 endif()
 
 if(CP2K_USE_PLUMED)
   find_package(Plumed REQUIRED)
 endif()
 
+set(CP2K_USE_LIBTORCH_CUDA OFF)
 if(CP2K_USE_LIBTORCH)
   find_package(Torch REQUIRED)
+  # Torch's CMake package disables CMAKE_CUDA_ARCHITECTURES after adding its own
+  # NVCC flags. Restore CP2K's selected target for the targets below.
+  if(CP2K_USE_ACCEL MATCHES CUDA)
+    set(CMAKE_CUDA_ARCHITECTURES "${CP2K_CUDA_ARCHITECTURES}")
+  elseif(CP2K_USE_ACCEL MATCHES HIP)
+    set(CMAKE_HIP_ARCHITECTURES "${CP2K_HIP_ARCHITECTURES}")
+  endif()
+  if(DEFINED TORCH_CUDA_LIBRARIES AND NOT "${TORCH_CUDA_LIBRARIES}" STREQUAL "")
+    set(CP2K_USE_LIBTORCH_CUDA ON)
+  endif()
   get_target_property(CP2K_TORCH_CXX_STANDARD torch CXX_STANDARD)
   if(${CP2K_TORCH_CXX_STANDARD} VERSION_GREATER ${CMAKE_CXX_STANDARD})
     set(CMAKE_CXX_STANDARD ${CP2K_TORCH_CXX_STANDARD})
     message("-- Torch setting CMAKE_CXX_STANDARD to ${CP2K_TORCH_CXX_STANDARD}")
+  endif()
+endif()
+
+if(CP2K_USE_SYMMETRIX)
+  # Explicit CP2K_SYMMETRIX_INCLUDE_DIR + CP2K_SYMMETRIX_LIBRARIES always win
+  # (escape hatch for unusual layouts); otherwise derive both from a symmetrix
+  # checkout + build tree given via CP2K_SYMMETRIX_ROOT (libsymmetrix ships no
+  # install/package-config rules yet, so plain find_package against an install
+  # prefix is not possible).
+  if(NOT (CP2K_SYMMETRIX_INCLUDE_DIR AND CP2K_SYMMETRIX_LIBRARIES))
+    find_package(Symmetrix REQUIRED)
+  endif()
+  # libsymmetrix is a plain C++20 static library (no torch); it is linked
+  # directly and symmetrix_c_api.cpp is compiled in-tree. It needs C++20.
+  if("${CMAKE_CXX_STANDARD}" STREQUAL "" OR CMAKE_CXX_STANDARD LESS 20)
+    set(CMAKE_CXX_STANDARD 20)
+    message("-- symmetrix setting CMAKE_CXX_STANDARD to 20")
+  endif()
+  if(CP2K_SYMMETRIX_KOKKOS)
+    # The Kokkos glue TU includes Kokkos CUDA headers, so it must be compiled by
+    # nvcc even when CP2K's own accelerator layer is off (the GPU work lives
+    # entirely inside libsymmetrix/Kokkos).
+    enable_language(CUDA)
+    if("${CMAKE_CUDA_STANDARD}" STREQUAL "" OR CMAKE_CUDA_STANDARD LESS 20)
+      set(CMAKE_CUDA_STANDARD 20)
+      message("-- symmetrix (Kokkos) setting CMAKE_CUDA_STANDARD to 20")
+    endif()
   endif()
 endif()
 
@@ -1154,6 +1226,14 @@ if(CP2K_USE_ACE)
   )
 endif()
 
+if(CP2K_USE_SYMMETRIX)
+  message(
+    "  - symmetrix\n"
+    "    - Kokkos (GPU) evaluator: ${CP2K_SYMMETRIX_KOKKOS}\n"
+    "    - Include directories: ${CP2K_SYMMETRIX_INCLUDE_DIR}\n"
+    "    - Libraries: ${CP2K_SYMMETRIX_LIBRARIES}\n")
+endif()
+
 if(CP2K_USE_LIBSMEAGOL)
   message("  - LibSMEAGOL\n"
           "    - Include directories: ${CP2K_LIBSMEAGOL_INCLUDE_DIRS}\n"
@@ -1337,6 +1417,10 @@ endif()
 
 if(NOT CP2K_USE_LIBTORCH)
   message("  - LibTorch")
+endif()
+
+if(NOT CP2K_USE_SYMMETRIX)
+  message("  - symmetrix")
 endif()
 
 if(NOT CP2K_USE_TREXIO)
