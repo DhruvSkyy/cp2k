@@ -55,9 +55,10 @@ MODULE pair_potential_types
                                  tab_type = 19, &
                                  deepmd_type = 20, &
                                  ace_type = 21, &
-                                 mace_type = 22
+                                 mace_type = 22, &
+                                 symmetrix_type = 23
 
-   INTEGER, PUBLIC, PARAMETER, DIMENSION(22) :: list_pot = [nn_type, &
+   INTEGER, PUBLIC, PARAMETER, DIMENSION(23) :: list_pot = [nn_type, &
                                                             lj_type, &
                                                             lj_charmm_type, &
                                                             ft_type, &
@@ -78,7 +79,8 @@ MODULE pair_potential_types
                                                             tab_type, &
                                                             deepmd_type, &
                                                             ace_type, &
-                                                            mace_type]
+                                                            mace_type, &
+                                                            symmetrix_type]
 
    ! Shell model
    INTEGER, PUBLIC, PARAMETER :: nosh_nosh = 0, &
@@ -111,6 +113,7 @@ MODULE pair_potential_types
              ipbv_pot_type, &
              eam_pot_type, &
              nequip_pot_type, &
+             symmetrix_pot_type, &
              deepmd_pot_type, &
              ace_pot_type, &
              tersoff_pot_type, &
@@ -204,6 +207,12 @@ MODULE pair_potential_types
    END TYPE nequip_pot_type
 
 ! **************************************************************************************************
+   TYPE symmetrix_pot_type
+      CHARACTER(LEN=default_path_length)     :: pot_file_name = 'NULL'
+      REAL(KIND=dp)                          :: rcutsq = 0.0_dp
+   END TYPE symmetrix_pot_type
+
+! **************************************************************************************************
    TYPE buck4ran_pot_type
       REAL(KIND=dp) :: a = 0.0_dp
       REAL(KIND=dp) :: b = 0.0_dp
@@ -232,11 +241,11 @@ MODULE pair_potential_types
 ! **************************************************************************************************
    TYPE gp_pot_type
       INTEGER                                   :: myid = 0
-      CHARACTER(LEN=default_path_length)       :: potential = ""
+      CHARACTER(LEN=default_path_length)        :: potential = ""
       CHARACTER(LEN=default_string_length), &
-         POINTER, DIMENSION(:)                   :: parameters => NULL(), units => NULL()
-      CHARACTER(LEN=default_string_length)     :: variables = ""
-      REAL(KIND=dp), DIMENSION(:), POINTER      :: values => NULL()
+         ALLOCATABLE, DIMENSION(:)              :: parameters
+      CHARACTER(LEN=default_string_length)      :: variables = ""
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE  :: values
    END TYPE gp_pot_type
 
 ! **************************************************************************************************
@@ -355,6 +364,7 @@ MODULE pair_potential_types
       TYPE(goodwin_pot_type), POINTER :: goodwin => NULL()
       TYPE(eam_pot_type), POINTER :: eam => NULL()
       TYPE(nequip_pot_type), POINTER :: nequip => NULL()
+      TYPE(symmetrix_pot_type), POINTER :: symmetrix => NULL()
       TYPE(ace_pot_type), POINTER :: ace => NULL()
       TYPE(deepmd_pot_type), POINTER :: deepmd => NULL()
       TYPE(buck4ran_pot_type), POINTER :: buck4r => NULL()
@@ -475,6 +485,8 @@ CONTAINS
                 (pot1%set(i)%nequip%unit_length == pot2%set(i)%nequip%unit_length) .AND. &
                 (pot1%set(i)%nequip%unit_forces == pot2%set(i)%nequip%unit_forces) .AND. &
                 (pot1%set(i)%nequip%unit_energy == pot2%set(i)%nequip%unit_energy)) mycompare = .TRUE.
+         CASE (symmetrix_type)
+            IF (pot1%set(i)%symmetrix%pot_file_name == pot2%set(i)%symmetrix%pot_file_name) mycompare = .TRUE.
          CASE (ft_type)
             IF ((pot1%set(i)%ft%A == pot2%set(i)%ft%A) .AND. &
                 (pot1%set(i)%ft%B == pot2%set(i)%ft%B) .AND. &
@@ -569,7 +581,26 @@ CONTAINS
                 (pot1%set(i)%gal21%express .EQV. &
                  pot2%set(i)%gal21%express) .AND. &
                 (pot1%set(i)%gal21%rcutsq == pot2%set(i)%gal21%rcutsq)) mycompare = .TRUE.
-
+         CASE (gp_type)
+            ! The original logic in get_nonbond_storage of pair_potential.F checks
+            ! only the parameters and values and returns true unless some different
+            ! value is found; in fact the potential and variables should also be
+            ! checked for matching strings
+            mycompare = .TRUE.
+            IF (ALLOCATED(pot1%set(i)%gp%parameters) .AND. ALLOCATED(pot2%set(i)%gp%parameters)) THEN
+               IF (SIZE(pot1%set(i)%gp%parameters) == SIZE(pot2%set(i)%gp%parameters)) THEN
+                  IF (ANY(pot1%set(i)%gp%parameters /= pot2%set(i)%gp%parameters)) THEN
+                     mycompare = .FALSE.
+                  END IF
+               END IF
+            END IF
+            IF (ALLOCATED(pot1%set(i)%gp%values) .AND. ALLOCATED(pot2%set(i)%gp%values)) THEN
+               IF (SIZE(pot1%set(i)%gp%values) == SIZE(pot2%set(i)%gp%values)) THEN
+                  IF (ANY(pot1%set(i)%gp%values /= pot2%set(i)%gp%values)) THEN
+                     mycompare = .FALSE.
+                  END IF
+               END IF
+            END IF
          END SELECT
          mycompare = mycompare .AND. &
                      (pot1%set(i)%rmin == pot2%set(i)%rmin) .AND. (pot1%set(i)%rmax == pot2%set(i)%rmax)
@@ -611,6 +642,7 @@ CONTAINS
                   potparm%set(i)%goodwin, &
                   potparm%set(i)%eam, &
                   potparm%set(i)%nequip, &
+                  potparm%set(i)%symmetrix, &
                   potparm%set(i)%ace, &
                   potparm%set(i)%deepmd, &
                   potparm%set(i)%buck4r, &
@@ -658,6 +690,7 @@ CONTAINS
          CALL pair_potential_goodwin_clean(potparm%set(i)%goodwin)
          CALL pair_potential_eam_clean(potparm%set(i)%eam)
          CALL pair_potential_nequip_clean(potparm%set(i)%nequip)
+         CALL pair_potential_symmetrix_clean(potparm%set(i)%symmetrix)
          CALL pair_potential_ace_clean(potparm%set(i)%ace)
          CALL pair_potential_deepmd_clean(potparm%set(i)%deepmd)
          CALL pair_potential_buck4r_clean(potparm%set(i)%buck4r)
@@ -715,6 +748,7 @@ CONTAINS
          CALL pair_potential_goodwin_copy(potparm_source%set(i)%goodwin, potparm_dest%set(i)%goodwin)
          CALL pair_potential_eam_copy(potparm_source%set(i)%eam, potparm_dest%set(i)%eam)
          CALL pair_potential_nequip_copy(potparm_source%set(i)%nequip, potparm_dest%set(i)%nequip)
+         CALL pair_potential_symmetrix_copy(potparm_source%set(i)%symmetrix, potparm_dest%set(i)%symmetrix)
          CALL pair_potential_ace_copy(potparm_source%set(i)%ace, potparm_dest%set(i)%ace)
          CALL pair_potential_deepmd_copy(potparm_source%set(i)%deepmd, potparm_dest%set(i)%deepmd)
          CALL pair_potential_bmhft_copy(potparm_source%set(i)%ft, potparm_dest%set(i)%ft)
@@ -817,6 +851,7 @@ CONTAINS
             CALL pair_potential_goodwin_copy(potparm_tmp%set(i)%goodwin, potparm_dest%set(i)%goodwin)
             CALL pair_potential_eam_copy(potparm_tmp%set(i)%eam, potparm_dest%set(i)%eam)
             CALL pair_potential_nequip_copy(potparm_tmp%set(i)%nequip, potparm_dest%set(i)%nequip)
+            CALL pair_potential_symmetrix_copy(potparm_tmp%set(i)%symmetrix, potparm_dest%set(i)%symmetrix)
             CALL pair_potential_ace_copy(potparm_tmp%set(i)%ace, potparm_dest%set(i)%ace)
             CALL pair_potential_deepmd_copy(potparm_tmp%set(i)%deepmd, potparm_dest%set(i)%deepmd)
             CALL pair_potential_bmhft_copy(potparm_tmp%set(i)%ft, potparm_dest%set(i)%ft)
@@ -853,6 +888,7 @@ CONTAINS
          CALL pair_potential_goodwin_copy(potparm_source%set(j)%goodwin, potparm_dest%set(i)%goodwin)
          CALL pair_potential_eam_copy(potparm_source%set(j)%eam, potparm_dest%set(i)%eam)
          CALL pair_potential_nequip_copy(potparm_source%set(j)%nequip, potparm_dest%set(i)%nequip)
+         CALL pair_potential_symmetrix_copy(potparm_source%set(j)%symmetrix, potparm_dest%set(i)%symmetrix)
          CALL pair_potential_ace_copy(potparm_source%set(j)%ace, potparm_dest%set(i)%ace)
          CALL pair_potential_deepmd_copy(potparm_source%set(j)%deepmd, potparm_dest%set(i)%deepmd)
          CALL pair_potential_bmhft_copy(potparm_source%set(j)%ft, potparm_dest%set(i)%ft)
@@ -891,6 +927,7 @@ CONTAINS
          CALL pair_potential_goodwin_release(potparm%set(i)%goodwin)
          CALL pair_potential_eam_release(potparm%set(i)%eam)
          CALL pair_potential_nequip_release(potparm%set(i)%nequip)
+         CALL pair_potential_symmetrix_release(potparm%set(i)%symmetrix)
          CALL pair_potential_ace_release(potparm%set(i)%ace)
          CALL pair_potential_deepmd_release(potparm%set(i)%deepmd)
          CALL pair_potential_buck4r_release(potparm%set(i)%buck4r)
@@ -1084,19 +1121,22 @@ CONTAINS
 !> \param tab ...
 !> \param deepmd ...
 !> \param ace ...
+!> \param symmetrix ...
 !> \author Teodoro Laino [Teo] 11.2005
 ! **************************************************************************************************
    SUBROUTINE pair_potential_reallocate(p, lb1_new, ub1_new, lj, lj_charmm, williams, goodwin, eam, &
-                                        nequip, bmhft, bmhftd, ipbv, buck4r, buckmo, &
-                                        gp, tersoff, siepmann, gal, gal21, tab, deepmd, ace)
+                                        nequip, bmhft, bmhftd, ipbv, buck4r, buckmo, gp, tersoff, &
+                                        siepmann, gal, gal21, tab, deepmd, ace, symmetrix)
       TYPE(pair_potential_p_type), POINTER               :: p
       INTEGER, INTENT(IN)                                :: lb1_new, ub1_new
       LOGICAL, INTENT(IN), OPTIONAL :: lj, lj_charmm, williams, goodwin, eam, nequip, bmhft, &
-         bmhftd, ipbv, buck4r, buckmo, gp, tersoff, siepmann, gal, gal21, tab, deepmd, ace
+         bmhftd, ipbv, buck4r, buckmo, gp, tersoff, siepmann, gal, gal21, tab, deepmd, ace, &
+         symmetrix
 
       INTEGER                                            :: i, ipot, lb1_old, std_dim, ub1_old
       LOGICAL :: check, lace, lbmhft, lbmhftd, lbuck4r, lbuckmo, ldeepmd, leam, lgal, lgal21, &
-         lgoodwin, lgp, lipbv, llj, llj_charmm, lnequip, lsiepmann, ltab, ltersoff, lwilliams
+         lgoodwin, lgp, lipbv, llj, llj_charmm, lnequip, lsiepmann, lsymmetrix, ltab, ltersoff, &
+         lwilliams
       TYPE(pair_potential_p_type), POINTER               :: work
 
       NULLIFY (work)
@@ -1107,6 +1147,7 @@ CONTAINS
       lgoodwin = .FALSE.; IF (PRESENT(goodwin)) lgoodwin = goodwin
       leam = .FALSE.; IF (PRESENT(eam)) leam = eam
       lnequip = .FALSE.; IF (PRESENT(nequip)) lnequip = nequip
+      lsymmetrix = .FALSE.; IF (PRESENT(symmetrix)) lsymmetrix = symmetrix
       lace = .FALSE.; IF (PRESENT(ace)) lace = ace
       ldeepmd = .FALSE.; IF (PRESENT(deepmd)) ldeepmd = deepmd
       lbmhft = .FALSE.; IF (PRESENT(bmhft)) lbmhft = bmhft
@@ -1125,40 +1166,53 @@ CONTAINS
          ipot = lj_type
          check = .NOT. (llj_charmm .OR. lwilliams .OR. lgoodwin .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lbuckmo .OR. lgp .OR. ltersoff &
-                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace)
+                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (llj_charmm) THEN
          ipot = lj_charmm_type
          check = .NOT. (llj .OR. lwilliams .OR. lgoodwin .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lbuckmo .OR. lgp .OR. ltersoff &
-                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace)
+                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (lwilliams) THEN
          ipot = wl_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lbuckmo .OR. lgp .OR. ltersoff &
-                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace)
+                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (lgoodwin) THEN
          ipot = gw_type
          check = .NOT. (llj .OR. llj_charmm .OR. lwilliams .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lbuckmo .OR. lgp .OR. ltersoff &
-                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace)
+                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (leam) THEN
          ipot = ea_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lbuckmo .OR. lgp .OR. ltersoff &
-                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace)
+                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (lnequip) THEN
          ipot = nequip_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. leam &
+                        .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lbuckmo .OR. lgp .OR. ltersoff &
+                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
+         CPASSERT(check)
+      END IF
+      IF (lsymmetrix) THEN
+         ipot = symmetrix_type
+         check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lbuckmo .OR. lgp .OR. ltersoff &
                         .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace)
          CPASSERT(check)
@@ -1167,91 +1221,104 @@ CONTAINS
          ipot = ace_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lbuckmo .OR. lgp &
-                        .OR. ltersoff .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd)
+                        .OR. ltersoff .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (ldeepmd) THEN
          ipot = deepmd_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lbuckmo .OR. lgp &
-                        .OR. ltersoff .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. lace)
+                        .OR. ltersoff .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (lbmhft) THEN
          ipot = ft_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. leam .OR. lnequip &
                         .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lbuckmo .OR. lgp .OR. ltersoff &
-                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace)
+                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (lbmhftd) THEN
          ipot = ftd_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lipbv .OR. lbuck4r .OR. lbuckmo .OR. lgp .OR. ltersoff &
-                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace)
+                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (lipbv) THEN
          ipot = ip_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lbuck4r .OR. lbuckmo .OR. lgp .OR. ltersoff &
-                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace)
+                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (lbuck4r) THEN
          ipot = b4_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuckmo .OR. lgp .OR. ltersoff &
-                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace)
+                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (lbuckmo) THEN
          ipot = bm_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lgp .OR. ltersoff &
-                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace)
+                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (ltersoff) THEN
          ipot = tersoff_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lgp .OR. lbuckmo &
-                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace)
+                        .OR. lsiepmann .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (lsiepmann) THEN
          ipot = siepmann_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lgp .OR. lbuckmo &
-                        .OR. ltersoff .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace)
+                        .OR. ltersoff .OR. lgal .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (lgal) THEN
          ipot = gal_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lgp .OR. lbuckmo &
-                        .OR. ltersoff .OR. lsiepmann .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace)
+                        .OR. ltersoff .OR. lsiepmann .OR. lgal21 .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (lgal21) THEN
          ipot = gal21_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lgp .OR. lbuckmo &
-                        .OR. ltersoff .OR. lsiepmann .OR. lgal .OR. ltab .OR. ldeepmd .OR. lace)
+                        .OR. ltersoff .OR. lsiepmann .OR. lgal .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (lgp) THEN
          ipot = gp_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lgal21 .OR. lbuckmo &
-                        .OR. ltersoff .OR. lsiepmann .OR. lgal .OR. ltab .OR. ldeepmd .OR. lace)
+                        .OR. ltersoff .OR. lsiepmann .OR. lgal .OR. ltab .OR. ldeepmd .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
       IF (ltab) THEN
          ipot = tab_type
          check = .NOT. (llj .OR. llj_charmm .OR. lgoodwin .OR. lwilliams .OR. leam .OR. lnequip &
                         .OR. lbmhft .OR. lbmhftd .OR. lipbv .OR. lbuck4r .OR. lgp .OR. lgal21 &
-                        .OR. lbuckmo .OR. ltersoff .OR. lsiepmann .OR. lgal .OR. lace)
+                        .OR. lbuckmo .OR. ltersoff .OR. lsiepmann .OR. lgal .OR. lace &
+                        .OR. lsymmetrix)
          CPASSERT(check)
       END IF
 
@@ -1293,6 +1360,8 @@ CONTAINS
             CALL pair_potential_eam_create(p%pot(i)%pot%set(std_dim)%eam)
          CASE (nequip_type, allegro_type, mace_type)
             CALL pair_potential_nequip_create(p%pot(i)%pot%set(std_dim)%nequip)
+         CASE (symmetrix_type)
+            CALL pair_potential_symmetrix_create(p%pot(i)%pot%set(std_dim)%symmetrix)
          CASE (ace_type)
             CALL pair_potential_ace_create(p%pot(i)%pot%set(std_dim)%ace)
          CASE (deepmd_type)
@@ -1337,8 +1406,6 @@ CONTAINS
 
       CPASSERT(.NOT. ASSOCIATED(gp))
       ALLOCATE (gp)
-      NULLIFY (gp%parameters)
-      NULLIFY (gp%values)
       CALL pair_potential_gp_clean(gp)
    END SUBROUTINE pair_potential_gp_create
 
@@ -1359,15 +1426,15 @@ CONTAINS
       gp_dest%myid = gp_source%myid
       gp_dest%potential = gp_source%potential
       gp_dest%variables = gp_source%variables
-      IF (ASSOCIATED(gp_source%parameters)) THEN
+      IF (ALLOCATED(gp_source%parameters)) THEN
          idim = SIZE(gp_source%parameters)
          ALLOCATE (gp_dest%parameters(idim))
-         gp_dest%parameters = gp_source%parameters
+         gp_dest%parameters(:) = gp_source%parameters
       END IF
-      IF (ASSOCIATED(gp_source%values)) THEN
+      IF (ALLOCATED(gp_source%values)) THEN
          idim = SIZE(gp_source%values)
          ALLOCATE (gp_dest%values(idim))
-         gp_dest%values = gp_source%values
+         gp_dest%values(:) = gp_source%values
       END IF
    END SUBROUTINE pair_potential_gp_copy
 
@@ -1383,10 +1450,10 @@ CONTAINS
       gp%myid = 0
       gp%potential = ""
       gp%variables = ""
-      IF (ASSOCIATED(gp%values)) THEN
+      IF (ALLOCATED(gp%values)) THEN
          DEALLOCATE (gp%values)
       END IF
-      IF (ASSOCIATED(gp%parameters)) THEN
+      IF (ALLOCATED(gp%parameters)) THEN
          DEALLOCATE (gp%parameters)
       END IF
    END SUBROUTINE pair_potential_gp_clean
@@ -1400,10 +1467,10 @@ CONTAINS
       TYPE(gp_pot_type), POINTER                         :: gp
 
       IF (ASSOCIATED(gp)) THEN
-         IF (ASSOCIATED(gp%parameters)) THEN
+         IF (ALLOCATED(gp%parameters)) THEN
             DEALLOCATE (gp%parameters)
          END IF
-         IF (ASSOCIATED(gp%values)) THEN
+         IF (ALLOCATED(gp%values)) THEN
             DEALLOCATE (gp%values)
          END IF
          DEALLOCATE (gp)
@@ -1860,6 +1927,54 @@ CONTAINS
          DEALLOCATE (nequip)
       END IF
    END SUBROUTINE pair_potential_nequip_release
+
+! **************************************************************************************************
+!> \brief Creates the symmetrix potential type
+!> \param symmetrix ...
+! **************************************************************************************************
+   SUBROUTINE pair_potential_symmetrix_create(symmetrix)
+      TYPE(symmetrix_pot_type), POINTER                  :: symmetrix
+
+      CPASSERT(.NOT. ASSOCIATED(symmetrix))
+      ALLOCATE (symmetrix)
+   END SUBROUTINE pair_potential_symmetrix_create
+
+! **************************************************************************************************
+!> \brief Copies the symmetrix potential type
+!> \param symmetrix_source ...
+!> \param symmetrix_dest ...
+! **************************************************************************************************
+   SUBROUTINE pair_potential_symmetrix_copy(symmetrix_source, symmetrix_dest)
+      TYPE(symmetrix_pot_type), POINTER                  :: symmetrix_source, symmetrix_dest
+
+      IF (.NOT. ASSOCIATED(symmetrix_source)) RETURN
+      IF (ASSOCIATED(symmetrix_dest)) CALL pair_potential_symmetrix_release(symmetrix_dest)
+      CALL pair_potential_symmetrix_create(symmetrix_dest)
+      symmetrix_dest = symmetrix_source
+   END SUBROUTINE pair_potential_symmetrix_copy
+
+! **************************************************************************************************
+!> \brief Cleans the symmetrix potential type
+!> \param symmetrix ...
+! **************************************************************************************************
+   SUBROUTINE pair_potential_symmetrix_clean(symmetrix)
+      TYPE(symmetrix_pot_type), POINTER                  :: symmetrix
+
+      IF (.NOT. ASSOCIATED(symmetrix)) RETURN
+      symmetrix = symmetrix_pot_type()
+   END SUBROUTINE pair_potential_symmetrix_clean
+
+! **************************************************************************************************
+!> \brief Releases the symmetrix potential type
+!> \param symmetrix ...
+! **************************************************************************************************
+   SUBROUTINE pair_potential_symmetrix_release(symmetrix)
+      TYPE(symmetrix_pot_type), POINTER                  :: symmetrix
+
+      IF (ASSOCIATED(symmetrix)) THEN
+         DEALLOCATE (symmetrix)
+      END IF
+   END SUBROUTINE pair_potential_symmetrix_release
 
 ! **************************************************************************************************
 !> \brief Creates the BMHFT (TOSI-FUMI) potential type

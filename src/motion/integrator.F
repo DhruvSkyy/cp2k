@@ -44,7 +44,10 @@ MODULE integrator
    USE constraint_util,                 ONLY: getold,&
                                               pv_constraint
    USE cp_control_types,                ONLY: dft_control_type
-   USE cp_log_handling,                 ONLY: cp_to_string
+   USE cp_log_handling,                 ONLY: cp_get_default_logger,&
+                                              cp_logger_type,&
+                                              cp_to_string
+   USE cp_output_handling,              ONLY: cp_iterate
    USE cp_parser_methods,               ONLY: parser_get_next_line,&
                                               parser_read_line
    USE cp_subsys_types,                 ONLY: cp_subsys_get,&
@@ -1520,6 +1523,7 @@ CONTAINS
                                                             vol
       REAL(KIND=dp), POINTER                             :: time
       TYPE(cell_type), POINTER                           :: cell
+      TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(cp_subsys_type), POINTER                      :: subsys
       TYPE(force_env_type), POINTER                      :: force_env
       TYPE(mp_para_env_type), POINTER                    :: para_env
@@ -1528,9 +1532,10 @@ CONTAINS
       TYPE(reftraj_type), POINTER                        :: reftraj_env
       TYPE(simpar_type), POINTER                         :: simpar
 
-      NULLIFY (reftraj_env, particle_set, particles, force_env, subsys, simpar, para_env, cell, itimes, time)
+      NULLIFY (reftraj_env, particle_set, particles, force_env, subsys, simpar, para_env, cell, logger, itimes, time)
       CALL get_md_env(md_env=md_env, init=init, reftraj=reftraj_env, force_env=force_env, &
                       para_env=para_env, simpar=simpar)
+      logger => cp_get_default_logger()
 
       CALL force_env_get(force_env=force_env, cell=cell, subsys=subsys)
       reftraj_env%isnap = reftraj_env%isnap + reftraj_env%info%stride
@@ -1685,8 +1690,12 @@ CONTAINS
       reftraj_env%epot = trj_epot
       reftraj_env%itimes = trj_itimes
       reftraj_env%time = trj_time/femtoseconds
-      CALL get_md_env(md_env, t=time)
+      CALL get_md_env(md_env, itimes=itimes, t=time)
+      itimes = reftraj_env%itimes
       time = reftraj_env%time
+      CALL cp_iterate(logger%iter_info, &
+                      last=logger%iter_info%last_iter(logger%iter_info%n_rlevel), &
+                      iter_nr=reftraj_env%itimes)
 
       IF (traj_has_cell_info) THEN
          CALL init_cell(cell)
@@ -2562,7 +2571,7 @@ CONTAINS
                                                             nparticle, nparticle_kind, &
                                                             nparticle_local
       INTEGER, POINTER                                   :: itimes
-      REAL(KIND=dp)                                      :: dm, dt, mass
+      REAL(KIND=dp)                                      :: constraint_dt, dm, dt, inner_dt, mass
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: pos, vel
       TYPE(atomic_kind_list_type), POINTER               :: atomic_kinds
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
@@ -2589,6 +2598,7 @@ CONTAINS
       dt = simpar%dt
 
       n_time_steps = simpar%n_time_steps
+      inner_dt = dt/n_time_steps
 
       CALL force_env_get(force_env, subsys=subsys, cell=cell)
       CALL force_env_get(force_env%sub_force_env(1)%force_env, subsys=subsys_respa)
@@ -2616,8 +2626,15 @@ CONTAINS
       ALLOCATE (vel(3, nparticle))
       vel(:, :) = 0.0_dp
 
-      IF (simpar%constraint) CALL getold(gci, local_molecules, molecule_set, &
-                                         molecule_kind_set, particle_set, cell)
+      constraint_dt = dt
+      IF (simpar%constraint) THEN
+         IF (gci%joint_colvar_checks) THEN
+            constraint_dt = inner_dt
+         ELSE
+            CALL getold(gci, local_molecules, molecule_set, &
+                        molecule_kind_set, particle_set, cell)
+         END IF
+      END IF
 
       ! Multiple time step (first part)
       DO iparticle_kind = 1, nparticle_kind
@@ -2635,6 +2652,8 @@ CONTAINS
 
       ! Velocity Verlet (first part)
       DO i_step = 1, n_time_steps
+         IF (gci%joint_colvar_checks) CALL getold(gci, local_molecules, molecule_set, &
+                                                  molecule_kind_set, particle_set, cell)
          pos(:, :) = 0.0_dp
          DO iparticle_kind = 1, nparticle_kind
             atomic_kind => atomic_kind_set(iparticle_kind)
@@ -2653,10 +2672,10 @@ CONTAINS
          IF (simpar%constraint) THEN
             ! Possibly update the target values
             CALL shake_update_targets(gci, local_molecules, molecule_set, &
-                                      molecule_kind_set, dt, force_env%root_section)
+                                      molecule_kind_set, inner_dt, force_env%root_section)
 
             CALL shake_control(gci, local_molecules, molecule_set, &
-                               molecule_kind_set, particle_set, pos, vel, dt, simpar%shake_tol, &
+                               molecule_kind_set, particle_set, pos, vel, constraint_dt, simpar%shake_tol, &
                                simpar%info_constraint, simpar%lagrange_multipliers, simpar%dump_lm, cell, &
                                para_env, local_particles)
          END IF
@@ -2688,7 +2707,7 @@ CONTAINS
          END DO
 
          IF (simpar%constraint) CALL rattle_control(gci, local_molecules, molecule_set, &
-                                                    molecule_kind_set, particle_set, vel, dt, simpar%shake_tol, &
+                                                    molecule_kind_set, particle_set, vel, constraint_dt, simpar%shake_tol, &
                                                     simpar%info_constraint, simpar%lagrange_multipliers, &
                                                     simpar%dump_lm, cell, para_env, local_particles)
 
@@ -2715,6 +2734,11 @@ CONTAINS
             vel(3, iparticle) = vel(3, iparticle) + dm*(particle_set(iparticle)%f(3) - particle_set_respa(iparticle)%f(3))
          END DO
       END DO
+
+      IF (gci%joint_colvar_checks) CALL rattle_control(gci, local_molecules, molecule_set, &
+                                                       molecule_kind_set, particle_set, vel, dt, simpar%shake_tol, &
+                                                       simpar%info_constraint, simpar%lagrange_multipliers, &
+                                                       simpar%dump_lm, cell, para_env, local_particles)
 
       ! Broadcast the new particle velocities
       CALL update_particle_set(particle_set, para_env, vel=vel)

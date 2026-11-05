@@ -380,7 +380,7 @@ static void collocate_one_grid_level(
             /*o2=*/jpgf * ncosetb,
             /*n1=*/ncoa,
             /*n2=*/ncob,
-            /*pab=*/(const double(*)[ncoa])pab,
+            /*pab=*/(const double (*)[ncoa])pab,
             /*grid=*/my_grid);
 
       } // end of task loop
@@ -403,11 +403,12 @@ static void collocate_one_grid_level(
       const int actual_group_size = imin(group_size, nthreads - dest_thread);
       // Parallelize summation by dividing grid points across group members.
       const int rank = modulo(ithread, group_size); // position within the group
-      const int lb = (npts_local_total * rank) / actual_group_size;
-      const int ub = (npts_local_total * (rank + 1)) / actual_group_size;
+      const int64_t lb = ((int64_t)npts_local_total * rank) / actual_group_size;
+      const int64_t ub =
+          ((int64_t)npts_local_total * (rank + 1)) / actual_group_size;
       if (src_thread < nthreads) {
         GRID_PRAGMA_SIMD_LOOP
-        for (int i = lb; i < ub; i++) {
+        for (int i = (int)lb; i < (int)ub; i++) {
           task_list->threadlocals[dest_thread][i] +=
               task_list->threadlocals[src_thread][i];
         }
@@ -416,10 +417,10 @@ static void collocate_one_grid_level(
     }
 
     // Copy final result from first thread into shared grid.
-    const int lb = (npts_local_total * ithread) / nthreads;
-    const int ub = (npts_local_total * (ithread + 1)) / nthreads;
+    const int64_t lb = ((int64_t)npts_local_total * ithread) / nthreads;
+    const int64_t ub = ((int64_t)npts_local_total * (ithread + 1)) / nthreads;
     GRID_PRAGMA_SIMD_LOOP
-    for (int i = lb; i < ub; i++) {
+    for (int i = (int)lb; i < (int)ub; i++) {
       grid->host_buffer[i] = task_list->threadlocals[0][i];
     }
 
@@ -610,8 +611,8 @@ static void integrate_one_grid_level(
             /*n1=*/ncoa,
             /*n2=*/ncob,
             /*grid=*/grid->host_buffer,
-            /*hab=*/(double(*)[ncoa])hab,
-            /*pab=*/(pab_required) ? (const double(*)[ncoa])pab : NULL,
+            /*hab=*/(double (*)[ncoa])hab,
+            /*pab=*/(pab_required) ? (const double (*)[ncoa])pab : NULL,
             /*forces=*/(forces != NULL) ? my_forces : NULL,
             /*virials=*/(virial != NULL) ? my_virials : NULL,
             /*hdab=*/NULL,

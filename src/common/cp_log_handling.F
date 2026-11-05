@@ -265,7 +265,7 @@ CONTAINS
 !> \param close_global_unit_on_dealloc if the unit should be closed when the
 !>        logger is deallocated (defaults to true if a local_filename is given,
 !>        to false otherwise)
-!> \param iter_info ...
+!> \param iter_info the iteration info type
 !> \param close_local_unit_on_dealloc if the unit should be closed when the
 !>        logger is deallocated (defaults to true)
 !> \param suffix the suffix that should be added to all the generated filenames
@@ -532,6 +532,13 @@ CONTAINS
          RETURN
       ELSE
          local_logger => cp_get_default_logger()
+         IF (local_logger%ref_count < 1) THEN
+            ! edge case: the default logger is just being released (e.g. a warning issued during
+            ! cp_rm_default_logger). Do not abort, because the error handlers call this function
+            ! themselves, which would result in an infinite recursion.
+            res = -1
+            RETURN
+         END IF
       END IF
 
       res = cp_logger_get_default_unit_nr(local_logger, local=.FALSE., skip_not_ionode=.TRUE.)

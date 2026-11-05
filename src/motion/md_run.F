@@ -17,6 +17,7 @@ MODULE md_run
    USE barostat_types,                  ONLY: barostat_type,&
                                               create_barostat_type
    USE cell_types,                      ONLY: cell_type
+   USE constraint_clv,                  ONLY: shake_update_colv_low
    USE cp_external_control,             ONLY: external_control
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
                                               cp_logger_get_default_io_unit,&
@@ -34,6 +35,7 @@ MODULE md_run
    USE force_env_methods,               ONLY: force_env_calc_energy_force
    USE force_env_types,                 ONLY: force_env_get,&
                                               force_env_type
+   USE force_env_utils,                 ONLY: force_env_rattle
    USE free_energy_methods,             ONLY: free_energy_evaluate
    USE free_energy_types,               ONLY: fe_env_create,&
                                               free_energy_type
@@ -76,8 +78,11 @@ MODULE md_run
    USE metadynamics,                    ONLY: metadyn_finalise_plumed,&
                                               metadyn_forces,&
                                               metadyn_initialise_plumed,&
+                                              metadyn_integrator,&
                                               metadyn_write_colvar
    USE metadynamics_types,              ONLY: set_meta_env
+   USE molecule_kind_types,             ONLY: molecule_kind_type
+   USE molecule_types,                  ONLY: global_constraint_type
    USE particle_list_types,             ONLY: particle_list_type
    USE qs_environment_methods,          ONLY: qs_env_time_update
    USE reftraj_types,                   ONLY: create_reftraj,&
@@ -242,7 +247,7 @@ CONTAINS
       CALL create_simpar_type(simpar)
       force_env_section => force_env%force_env_section
       subsys_section => section_vals_get_subs_vals(force_env_section, "SUBSYS")
-      CALL cp_add_iter_level(logger%iter_info, "MD")
+      CALL cp_add_iter_level(logger, "MD")
       CALL cp_iterate(logger%iter_info, iter_nr=0)
       ! Read MD section
       CALL read_md_section(simpar, motion_section, md_section)
@@ -313,6 +318,7 @@ CONTAINS
 
       CALL set_md_env(md_env=md_env, simpar=simpar, fe_env=fe_env, cell=cell, &
                       force_env=force_env)
+      IF (simpar%constraint) CALL initialize_moving_colvars(force_env, motion_section, simpar)
 
       ! Possibly initialize Wiener processes
       ![NB] Tested again within create_wiener_process.  Why??
@@ -395,6 +401,9 @@ CONTAINS
             ! Setup stuff for plumed if needed
             IF (force_env%meta_env%use_plumed .EQV. .TRUE.) THEN
                CALL metadyn_initialise_plumed(force_env, simpar, itimes)
+               ! Include the bias in the first half kick and initial energy/pressure.
+               ! This also initializes PLUMED's first-step bookkeeping on restart.
+               CALL metadyn_integrator(force_env, itimes)
             ELSE
                IF (force_env%meta_env%langevin) THEN
                   CALL create_wiener_process_cv(force_env%meta_env)
@@ -465,14 +474,6 @@ CONTAINS
 
       ! Real MD Loop
       DO istep = 1, simpar%nsteps, md_stride
-         IF (output_unit > 0) THEN
-            WRITE (md_step_line, FMT="(A,I12,A,I0)") "MD STEP: ", istep, " / ", simpar%nsteps
-
-            WRITE (UNIT=output_unit, FMT="(/,T2,A)") REPEAT("-", LEN_TRIM(md_step_line))
-            WRITE (UNIT=output_unit, FMT="(T2,A)") TRIM(md_step_line)
-            WRITE (UNIT=output_unit, FMT="(T2,A)") REPEAT("-", LEN_TRIM(md_step_line))
-            CALL m_flush(output_unit)
-         END IF
          ! Increase counters
          itimes = itimes + 1
          time = time + simpar%dt
@@ -486,6 +487,17 @@ CONTAINS
             CALL cp_iterate(logger%iter_info, last=(istep == simpar%nsteps), iter_nr=itimes)
          ELSE
             CALL cp_iterate(logger%iter_info, last=.TRUE., iter_nr=itimes)
+         END IF
+
+         IF (output_unit > 0 .AND. &
+             BTEST(cp_print_key_should_output(logger%iter_info, md_section, &
+                                              "PRINT%PROGRAM_RUN_INFO"), cp_p_file)) THEN
+            WRITE (md_step_line, FMT="(A,I12,A,I0)") "MD STEP: ", istep, " / ", simpar%nsteps
+
+            WRITE (UNIT=output_unit, FMT="(/,T2,A)") REPEAT("-", LEN_TRIM(md_step_line))
+            WRITE (UNIT=output_unit, FMT="(T2,A)") TRIM(md_step_line)
+            WRITE (UNIT=output_unit, FMT="(T2,A)") REPEAT("-", LEN_TRIM(md_step_line))
+            CALL m_flush(output_unit)
          END IF
 
          ! Open possible Shake output units
@@ -569,7 +581,7 @@ CONTAINS
       IF (PRESENT(hmc_e_final)) hmc_e_final = md_ener%ekin
 
       ! Remove the iteration level
-      CALL cp_rm_iter_level(logger%iter_info, "MD")
+      CALL cp_rm_iter_level(logger, "MD")
 
       ! Clean up PLUMED
       IF (ASSOCIATED(force_env%meta_env)) THEN
@@ -583,5 +595,41 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE qs_mol_dyn_low
+
+! **************************************************************************************************
+!> \brief Project initial or restarted velocities onto the upcoming target rate.
+!> \param force_env ...
+!> \param motion_section ...
+!> \param simpar ...
+! **************************************************************************************************
+   SUBROUTINE initialize_moving_colvars(force_env, motion_section, simpar)
+      TYPE(force_env_type), POINTER                      :: force_env
+      TYPE(section_vals_type), POINTER                   :: motion_section
+      TYPE(simpar_type), POINTER                         :: simpar
+
+      INTEGER                                            :: i
+      LOGICAL                                            :: moving
+      REAL(KIND=dp)                                      :: dt
+      TYPE(cp_subsys_type), POINTER                      :: subsys
+      TYPE(global_constraint_type), POINTER              :: gci
+      TYPE(molecule_kind_type), POINTER                  :: kinds(:)
+
+      CALL force_env_get(force_env, subsys=subsys)
+      CALL cp_subsys_get(subsys, molecule_kind_set=kinds, gci=gci)
+      dt = simpar%dt
+      IF (simpar%do_respa) dt = dt/simpar%n_time_steps
+      moving = .FALSE.
+      DO i = 1, SIZE(kinds)
+         IF (.NOT. ASSOCIATED(kinds(i)%colv_list)) CYCLE
+         CALL shake_update_colv_low(kinds(i)%colv_list, dt, motion_section, initialize=.TRUE.)
+         moving = moving .OR. ANY(kinds(i)%colv_list%expected_value_growth_speed /= 0.0_dp)
+      END DO
+      IF (ASSOCIATED(gci%colv_list)) THEN
+         CALL shake_update_colv_low(gci%colv_list, dt, motion_section, initialize=.TRUE.)
+         moving = moving .OR. ANY(gci%colv_list%expected_value_growth_speed /= 0.0_dp)
+      END IF
+      gci%joint_colvar_checks = moving
+      IF (moving) CALL force_env_rattle(force_env, dt=dt, shake_tol=simpar%shake_tol, reset=.TRUE.)
+   END SUBROUTINE initialize_moving_colvars
 
 END MODULE md_run

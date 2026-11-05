@@ -150,6 +150,17 @@ static void backend_stop(backend_context_t *ctx) {
 }
 
 /*******************************************************************************
+ * \brief Private routine returning the seconds since tick, which it resets.
+ * \author Hans Pabst
+ ******************************************************************************/
+static double phase_lap(double *tick) {
+  const double now = omp_get_wtime();
+  const double result = now - *tick;
+  *tick = now;
+  return result;
+}
+
+/*******************************************************************************
  * \brief Private routine for multiplying two packs (C += alpha * A * B).
  *
  * Blocks in each pack are grouped by shard (free_index % nshards) and sorted
@@ -200,6 +211,8 @@ static void multiply_packs(const bool transa, const bool transb,
     // Thread-private array covering given work in piece-wise fashion.
     dbm_task_t *batch =
         offload_mempool_host_malloc(sizeof(dbm_task_t) * DBM_MAX_BATCH_SIZE);
+    // Thread-local stats, added to the library's counters once at the end.
+    int64_t counters[DBM_NUM_COUNTERS] = {0};
 
     // Blocks are ordered first by shard. Creating lookup tables of boundaries.
 #pragma omp for nowait
@@ -292,6 +305,18 @@ static void multiply_packs(const bool transa, const bool transb,
           for (int jb = b_range_start; jb < b_range_end; ++jb) {
             const dbm_pack_block_t *const blk_b = &pack_b->blocks[jb];
 
+            // Overlap the two dependent cache misses of upcoming lookups.
+            if (jb + DBM_PREFETCH_SLOT < b_range_end) {
+              dbm_shard_prefetch_slot(
+                  shard_c, blk_a->free_index,
+                  pack_b->blocks[jb + DBM_PREFETCH_SLOT].free_index);
+            }
+            if (jb + DBM_PREFETCH_BLOCK < b_range_end) {
+              dbm_shard_prefetch_block(
+                  shard_c, blk_a->free_index,
+                  pack_b->blocks[jb + DBM_PREFETCH_BLOCK].free_index);
+            }
+
             // Norm filter first (early reject).
             const float result_norm = alpha2 * blk_a->norm * blk_b->norm;
             if (result_norm < rows_max_eps[blk_a->free_index]) {
@@ -326,7 +351,7 @@ static void multiply_packs(const bool transa, const bool transb,
             // Count flops.
             const int64_t task_flops = 2LL * m * n * k;
             flop_sum += task_flops;
-            dbm_library_counter_increment(m, n, k);
+            ++counters[dbm_library_counter_index(m, n, k)];
 
             // Add block multiplication to batch.
             dbm_task_t *const tptr = &batch[ntasks];
@@ -353,6 +378,7 @@ static void multiply_packs(const bool transa, const bool transb,
       }
     }
 
+    dbm_library_counters_add(counters);
     offload_mempool_host_free(batch);
   }
 
@@ -376,6 +402,8 @@ void dbm_multiply(const bool transa, const bool transb, const double alpha,
                   int64_t *flop) {
   assert(omp_get_num_threads() == 1);
   assert(matrix_a != NULL && matrix_b != NULL && matrix_c != NULL);
+  double phase[DBM_NUM_PHASES] = {0}, tick = omp_get_wtime();
+  int64_t phase_bytes[DBM_NUM_PHASES] = {0};
 
   // Throughout the matrix multiplication code the "sum_index" and "free_index"
   // denote the summation (aka dummy) and free index from the Einstein notation.
@@ -399,11 +427,13 @@ void dbm_multiply(const bool transa, const bool transb, const double alpha,
   const int verify =
       (NULL == verify_env ? (NULL == maxeps_env ? 0 : 1) : atoi(verify_env));
   dbm_matrix_t *matrix_d = NULL;
+  phase[DBM_PHASE_SETUP] += phase_lap(&tick);
   if (0 != verify) {
     dbm_distribution_t *const dist_shared = matrix_c->dist;
     dbm_create(&matrix_d, dist_shared, matrix_c->name, matrix_c->nrows,
                matrix_c->ncols, matrix_c->row_sizes, matrix_c->col_sizes);
     dbm_copy(matrix_d, matrix_c);
+    tick = omp_get_wtime(); // validation is not a phase
   }
 
   // Compute filter thresholds for each row.
@@ -411,10 +441,17 @@ void dbm_multiply(const bool transa, const bool transb, const double alpha,
 
   // Start uploading matrix_c to the GPU.
   backend_context_t *ctx = backend_start(matrix_c);
+  phase[DBM_PHASE_SETUP] += phase_lap(&tick);
 
   // Redistribute matrix_a and matrix_b across MPI ranks.
   dbm_comm_iterator_t *iter =
       dbm_comm_iterator_start(transa, transb, matrix_a, matrix_b, matrix_c);
+  const double redistribute = phase_lap(&tick);
+  phase[DBM_PHASE_ALLTOALL] += iter->seconds_alltoall;
+  phase[DBM_PHASE_SORT] += iter->seconds_sort;
+  phase_bytes[DBM_PHASE_ALLTOALL] += iter->bytes_alltoall;
+  phase[DBM_PHASE_PACK] +=
+      redistribute - iter->seconds_alltoall - iter->seconds_sort;
 
   // Count flops if requested.
   if (NULL != flop) {
@@ -424,16 +461,22 @@ void dbm_multiply(const bool transa, const bool transb, const double alpha,
   // Main loop.
   dbm_pack_t *pack_a, *pack_b;
   while (dbm_comm_iterator_next(iter, &pack_a, &pack_b)) {
+    phase[DBM_PHASE_SHIFT] += phase_lap(&tick);
     const bool uploaded = backend_upload_packs(pack_a, pack_b, ctx);
     (void)uploaded; // mark used
+    phase[DBM_PHASE_UPLOAD] += phase_lap(&tick);
     multiply_packs(transa, transb, alpha, pack_a, pack_b, matrix_a, matrix_b,
                    matrix_c, rows_max_eps, retain_sparsity, false /*!uploaded*/,
                    flop, ctx);
+    phase[DBM_PHASE_MULTIPLY] += phase_lap(&tick);
   }
 
   // Wait for all other MPI ranks to complete, then release ressources.
+  phase_bytes[DBM_PHASE_SHIFT] += iter->bytes_shift;
   dbm_comm_iterator_stop(iter);
+  phase[DBM_PHASE_SHIFT] += phase_lap(&tick);
   backend_stop(ctx);
+  phase[DBM_PHASE_FINISH] += phase_lap(&tick);
 
   if (NULL != matrix_d) {
     ctx = backend_start(matrix_d);
@@ -455,6 +498,7 @@ void dbm_multiply(const bool transa, const bool transb, const double alpha,
       }
     }
     dbm_release(matrix_d);
+    tick = omp_get_wtime(); // validation is not a phase
   }
 
   // Release filter thresholds.
@@ -462,6 +506,8 @@ void dbm_multiply(const bool transa, const bool transb, const double alpha,
 
   // Final filter pass.
   dbm_filter(matrix_c, filter_eps);
+  phase[DBM_PHASE_SETUP] += phase_lap(&tick);
+  dbm_library_phases_add(phase, phase_bytes);
 }
 
 // EOF

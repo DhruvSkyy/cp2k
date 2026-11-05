@@ -50,8 +50,8 @@ MODULE qs_initial_guess
                                               sgp_potential_type
    USE hfx_types,                       ONLY: hfx_type
    USE input_constants,                 ONLY: &
-        atomic_guess, core_guess, eht_guess, history_guess, mopac_guess, no_guess, random_guess, &
-        restart_guess, sparse_guess
+        atomic_guess, core_guess, eht_guess, external_density_guess, history_guess, mopac_guess, &
+        no_guess, random_guess, restart_guess, sparse_guess
    USE input_cp2k_hfx,                  ONLY: ri_mo
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
                                               section_vals_type,&
@@ -240,6 +240,10 @@ CONTAINS
       nspin = dft_control%nspins
       ofgpw = dft_control%qs_control%ofgpw
       density_guess = scf_control%density_guess
+      ! The cube density initializes the first KS potential. Keep an atomic AO
+      ! density matrix and MO set as auxiliary state until the first regular
+      ! solver step creates a density matrix consistent with that potential.
+      IF (density_guess == external_density_guess) density_guess = atomic_guess
       do_std_diag = .FALSE.
 
       do_hfx_ri_mo = .FALSE.
@@ -249,12 +253,12 @@ CONTAINS
          END IF
       END IF
 
-      IF (ASSOCIATED(scf_env%krylov_space)) do_std_diag = (scf_env%krylov_space%eps_std_diag > 0.0_dp)
+      IF (ASSOCIATED(scf_env%krylov_settings)) do_std_diag = (scf_env%krylov_settings%eps_std_diag > 0.0_dp)
 
       need_mos = scf_control%use_ot .OR. scf_env%method == ot_diag_method_nr .OR. &
-                 (scf_env%method == block_krylov_diag_method_nr .AND. .NOT. do_std_diag) &
-                 .OR. dft_control%do_admm .OR. scf_env%method == block_davidson_diag_method_nr &
-                 .OR. do_hfx_ri_mo
+                 (scf_env%method == block_krylov_diag_method_nr .AND. .NOT. do_kpoints .AND. .NOT. do_std_diag) &
+                 .OR. dft_control%do_admm .OR. do_hfx_ri_mo .OR. &
+                 (scf_env%method == block_davidson_diag_method_nr .AND. .NOT. do_kpoints)
 
       safe_density_guess = atomic_guess
       IF (dft_control%qs_control%semi_empirical .OR. dft_control%qs_control%dftb) THEN
@@ -407,11 +411,6 @@ CONTAINS
                density_guess = safe_density_guess
             ELSE
                DO ispin = 1, nspin
-                  IF (scf_control%level_shift /= 0.0_dp) THEN
-                     CALL get_mo_set(mo_set=mo_array(ispin), mo_coeff=mo_coeff)
-                     CALL cp_fm_to_fm(mo_coeff, ortho)
-                  END IF
-
                   ! make all nmo vectors present orthonormal
                   CALL get_mo_set(mo_set=mo_array(ispin), &
                                   mo_coeff=mo_coeff, nmo=nmo, homo=homo)
@@ -478,11 +477,6 @@ CONTAINS
                                              dft_section=dft_section, out_unit=ounit)
 
                DO ispin = 1, nspin
-                  IF (scf_control%level_shift /= 0.0_dp) THEN
-                     CALL get_mo_set(mo_set=mo_array(ispin), mo_coeff=mo_coeff)
-                     CALL cp_fm_to_fm(mo_coeff, ortho)
-                  END IF
-
                   ! make all nmo vectors present orthonormal
                   CALL get_mo_set(mo_set=mo_array(ispin), mo_coeff=mo_coeff, nmo=nmo, homo=homo)
 

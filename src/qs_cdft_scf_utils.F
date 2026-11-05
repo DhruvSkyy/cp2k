@@ -14,7 +14,6 @@
 MODULE qs_cdft_scf_utils
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_files,                        ONLY: close_file,&
-                                              get_unit_number,&
                                               open_file
    USE cp_log_handling,                 ONLY: cp_logger_create,&
                                               cp_logger_type,&
@@ -236,6 +235,7 @@ CONTAINS
          END DO
          IF (use_md_history) THEN
             ALLOCATE (jacobian(nvar, nvar))
+            jacobian = 0.0_dp
             DO i = 1, nvar
                jacobian(i, i) = (gradient_history(i, 2) - gradient_history(i, 1))/ &
                                 (variable_history(i, 2) - variable_history(i, 1))
@@ -262,6 +262,7 @@ CONTAINS
                           "to 3 for optimizers that build the Jacobian from SCF history.")
          END IF
          ALLOCATE (jacobian(nvar, nvar))
+         jacobian = 0.0_dp
          DO i = 1, nvar
             jacobian(i, i) = (scf_env%outer_scf%gradient(i, ihistory) - scf_env%outer_scf%gradient(i, ihistory - 1))/ &
                              (scf_env%outer_scf%variables(i, ihistory) - scf_env%outer_scf%variables(i, ihistory - 1))
@@ -339,12 +340,13 @@ CONTAINS
       INTEGER                                            :: i, j, lp, nvar, output_unit
 
       nvar = SIZE(inv_jacobian, 1)
-      output_unit = get_unit_number()
       project_name = logger%iter_info%project_name
       lp = LEN_TRIM(project_name)
       project_name(lp + 1:LEN(project_name)) = ".inverseJacobian"
-      CALL open_file(file_name=project_name, file_status="UNKNOWN", &
-                     file_action="WRITE", file_position="APPEND", &
+      CALL open_file(file_name=project_name, &
+                     file_status="UNKNOWN", &
+                     file_action="WRITE", &
+                     file_position="APPEND", &
                      unit_number=output_unit)
       WRITE (output_unit, FMT="(/,A)") "Inverse Jacobian matrix in row major order"
       WRITE (output_unit, FMT="(A,I10)") "Iteration: ", iter_count

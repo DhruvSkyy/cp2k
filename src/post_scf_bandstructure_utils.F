@@ -14,9 +14,12 @@ MODULE post_scf_bandstructure_utils
    USE atomic_kind_types,               ONLY: atomic_kind_type,&
                                               get_atomic_kind,&
                                               get_atomic_kind_set
+   USE bse_input,                       ONLY: read_bse_section
+   USE bse_main,                        ONLY: bse_fulldiag_memory_check
+   USE bse_types,                       ONLY: bse_env_type
+   USE bse_util,                        ONLY: bse_window_from_dft
    USE cell_types,                      ONLY: cell_type,&
-                                              get_cell,&
-                                              pbc
+                                              get_cell
    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
    USE cp_cfm_basic_linalg,             ONLY: cp_cfm_scale
    USE cp_cfm_cholesky,                 ONLY: cp_cfm_cholesky_decompose
@@ -52,15 +55,17 @@ MODULE post_scf_bandstructure_utils
                                               cp_fm_release,&
                                               cp_fm_set_all,&
                                               cp_fm_to_fm,&
+                                              cp_fm_to_fm_submat,&
                                               cp_fm_type
    USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit,&
                                               cp_to_string
    USE cp_parser_methods,               ONLY: read_float_object
-   USE input_constants,                 ONLY: int_ldos_z,&
-                                              large_cell_Gamma,&
-                                              large_cell_Gamma_ri_rs,&
-                                              non_periodic_ri_rs,&
-                                              small_cell_full_kp
+   USE dft_plus_u,                      ONLY: lowdin_kp_apply,&
+                                              lowdin_kp_prepare
+   USE input_constants,                 ONLY: &
+        G0W0, bse_fulldiag, cohsex_off, evGW0, int_ldos_z, ri_rs_large_cell_Gamma, &
+        ri_rs_non_periodic, smear_fermi_dirac, smear_gaussian, smear_mp, smear_mv, &
+        tensor_large_cell_Gamma, tensor_small_cell_full_kp, tensor_static_cohsex
    USE input_section_types,             ONLY: section_vals_get,&
                                               section_vals_get_subs_vals,&
                                               section_vals_type,&
@@ -68,10 +73,12 @@ MODULE post_scf_bandstructure_utils
    USE kinds,                           ONLY: default_string_length,&
                                               dp,&
                                               max_line_length
+   USE kpoint_k_r_trafo_simple,         ONLY: fm_gamma_to_kp
    USE kpoint_methods,                  ONLY: kpoint_init_cell_index,&
                                               rskp_transform
    USE kpoint_types,                    ONLY: get_kpoint_info,&
                                               kpoint_create,&
+                                              kpoint_env_type,&
                                               kpoint_type
    USE machine,                         ONLY: m_walltime
    USE mathconstants,                   ONLY: gaussi,&
@@ -79,6 +86,7 @@ MODULE post_scf_bandstructure_utils
                                               z_one,&
                                               z_zero
    USE message_passing,                 ONLY: mp_para_env_type
+   USE mo_window,                       ONLY: mo_window_type
    USE parallel_gemm_api,               ONLY: parallel_gemm
    USE particle_types,                  ONLY: particle_type
    USE physcon,                         ONLY: angstrom,&
@@ -102,6 +110,8 @@ MODULE post_scf_bandstructure_utils
    USE rpa_gw_im_time_util,             ONLY: compute_weight_re_im,&
                                               get_atom_index_from_basis_function_index
    USE scf_control_types,               ONLY: scf_control_type
+   USE smearing_utils,                  ONLY: Smearkp,&
+                                              Smearkp2
    USE soc_pseudopotential_methods,     ONLY: V_SOC_xyz_from_pseudopotential,&
                                               remove_soc_outside_energy_window_mo
    USE soc_pseudopotential_utils,       ONLY: add_cfm_submat,&
@@ -119,11 +129,70 @@ MODULE post_scf_bandstructure_utils
    PUBLIC :: create_and_init_bs_env, &
              eval_bandstructure_properties, cfm_ikp_from_fm_Gamma, &
              MIC_contribution_from_ikp, compute_xkp, kpoint_init_cell_index_simple, &
-             rsmat_to_kp, soc, get_VBM_CBM_bandgaps, get_all_VBM_CBM_bandgaps
+             rsmat_to_kp, soc, get_VBM_CBM_bandgaps, get_all_VBM_CBM_bandgaps, &
+             allocate_GW_eigenvalues, gw_flavour_label
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'post_scf_bandstructure_utils'
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Allocate the arrays holding the GW quasiparticle energies
+!> \param bs_env ...
+! **************************************************************************************************
+   SUBROUTINE allocate_GW_eigenvalues(bs_env)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'allocate_GW_eigenvalues'
+
+      INTEGER                                            :: handle, n_ao, n_spin, nkp
+
+      CALL timeset(routineN, handle)
+
+      n_ao = bs_env%n_ao
+      nkp = bs_env%nkp_bs_and_DOS
+      n_spin = bs_env%n_spin
+
+      IF (.NOT. ALLOCATED(bs_env%eigenval_GW)) THEN
+         ALLOCATE (bs_env%eigenval_GW(n_ao, nkp, n_spin))
+      END IF
+      IF (.NOT. ALLOCATED(bs_env%eigenval_HF)) THEN
+         ALLOCATE (bs_env%eigenval_HF(n_ao, nkp, n_spin))
+      END IF
+
+      SELECT CASE (bs_env%gw_flavour)
+      CASE (G0W0, evGW0)
+         IF (.NOT. ALLOCATED(bs_env%eigenval_G0W0)) THEN
+            ALLOCATE (bs_env%eigenval_G0W0(n_ao, nkp, n_spin))
+         END IF
+      END SELECT
+
+      IF (bs_env%gw_flavour == evGW0 .AND. .NOT. ALLOCATED(bs_env%eigenval_evGW0)) THEN
+         ALLOCATE (bs_env%eigenval_evGW0(n_ao, nkp, n_spin))
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE allocate_GW_eigenvalues
+
+! **************************************************************************************************
+!> \brief Name of the GW flavour that was requested, for printing
+!> \param bs_env ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION gw_flavour_label(bs_env) RESULT(label)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      CHARACTER(LEN=default_string_length)               :: label
+
+      SELECT CASE (bs_env%gw_flavour)
+      CASE (evGW0)
+         label = "evGW0"
+      CASE DEFAULT
+         label = "G0W0"
+      END SELECT
+      IF (bs_env%do_static_cohsex) label = "static COHSEX"
+
+   END FUNCTION gw_flavour_label
 
 ! **************************************************************************************************
 !> \brief ...
@@ -152,8 +221,8 @@ CONTAINS
 
       CALL set_heuristic_parameters(bs_env)
 
-      SELECT CASE (bs_env%small_cell_full_kp_or_large_cell_Gamma)
-      CASE (large_cell_Gamma, large_cell_Gamma_ri_rs, non_periodic_ri_rs)
+      SELECT CASE (bs_env%gw_implementation)
+      CASE (tensor_large_cell_Gamma, ri_rs_large_cell_Gamma, ri_rs_non_periodic, tensor_static_cohsex)
 
          CALL setup_kpoints_DOS_large_cell_Gamma(qs_env, bs_env, bs_env%kpoints_DOS)
 
@@ -163,10 +232,9 @@ CONTAINS
 
          CALL check_positive_definite_overlap_mat(bs_env, qs_env)
 
-      CASE (small_cell_full_kp)
+      CASE (tensor_small_cell_full_kp)
 
          CALL setup_kpoints_scf_desymm(qs_env, bs_env, bs_env%kpoints_scf_desymm, .TRUE.)
-         CALL setup_kpoints_scf_desymm(qs_env, bs_env, bs_env%kpoints_scf_desymm_2, .FALSE.)
 
          CALL setup_kpoints_DOS_small_cell_full_kp(bs_env, bs_env%kpoints_DOS)
 
@@ -176,9 +244,59 @@ CONTAINS
 
       END SELECT
 
+      CALL read_bse_input(qs_env, bs_env)
+
       CALL timestop(handle)
 
    END SUBROUTINE create_and_init_bs_env
+
+! **************************************************************************************************
+!> \brief What PROPERTIES%BSE needs the GW to keep and, with FULLDIAG, the early memory check of the
+!>        full diagonalization; check_cp2k_input refused the input combinations the BSE cannot run
+!> \param qs_env source of the input
+!> \param bs_env SCF eigenvalues and occupations of the memory check; keep_W_freq_zero and keep_3c_nl are set
+! **************************************************************************************************
+   SUBROUTINE read_bse_input(qs_env, bs_env)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'read_bse_input'
+
+      INTEGER                                            :: handle, n_spin
+      INTEGER, DIMENSION(2)                              :: n_mo
+      LOGICAL                                            :: do_bse_props
+      TYPE(bse_env_type)                                 :: bse_env
+      TYPE(mo_window_type)                               :: window
+      TYPE(section_vals_type), POINTER                   :: bse_sec, input
+
+      CALL timeset(routineN, handle)
+
+      NULLIFY (bse_sec, input)
+      CALL get_qs_env(qs_env, input=input)
+      bse_sec => section_vals_get_subs_vals(input, "PROPERTIES%BSE")
+      CALL section_vals_get(bse_sec, explicit=do_bse_props)
+
+      IF (do_bse_props) THEN
+         ! the full diagonalization's footprint is known here, before any GW work
+         CALL read_bse_section(bse_sec, bse_env)
+         IF (bse_env%bse_diag_method == bse_fulldiag) THEN
+            n_spin = bs_env%n_spin
+            ! the canonical orthogonalisation parks the linearly dependent directions above n_mo_retained
+            n_mo(:) = MIN(bs_env%n_mo_retained, bs_env%n_ao)
+            ! the BSE warns about a combined window when it starts; the estimate stays silent
+            CALL bse_window_from_dft(bs_env%eigenval_scf_Gamma(1:n_mo(1), 1:n_spin), n_mo(1:n_spin), &
+                                     bs_env%n_occ(1:n_spin), bse_env%bse_cutoff_occ, &
+                                     bse_env%bse_cutoff_empty, window, warn=.FALSE.)
+            CALL bse_fulldiag_memory_check(bse_env, window, bs_env%n_occ(1:n_spin), bs_env%para_env, &
+                                           bs_env%unit_nr)
+         END IF
+      END IF
+      bs_env%keep_W_freq_zero = do_bse_props
+      bs_env%keep_3c_nl = do_bse_props
+
+      CALL timestop(handle)
+
+   END SUBROUTINE read_bse_input
 
 ! **************************************************************************************************
 !> \brief ...
@@ -213,7 +331,9 @@ CONTAINS
       NULLIFY (gw_sec)
       gw_sec => section_vals_get_subs_vals(bs_sec, "GW")
       CALL section_vals_get(gw_sec, explicit=bs_env%do_gw)
-      CALL section_vals_val_get(gw_sec, "RI_RS", l_val=bs_env%do_gw_ri_rs)
+      CALL section_vals_val_get(gw_sec, "COHSEX%_SECTION_PARAMETERS_", i_val=bs_env%cohsex_flavor)
+      bs_env%do_static_cohsex = (bs_env%cohsex_flavor /= cohsex_off)
+      CALL section_vals_val_get(gw_sec, "RI_RS%_SECTION_PARAMETERS_", l_val=bs_env%do_gw_ri_rs)
 
       NULLIFY (soc_sec)
       soc_sec => section_vals_get_subs_vals(bs_sec, "SOC")
@@ -222,6 +342,9 @@ CONTAINS
       CALL section_vals_val_get(soc_sec, "SOC_WINDOW_OCC", r_val=bs_env%soc_window_occ)
       CALL section_vals_val_get(soc_sec, "SOC_WINDOW_VIRT", r_val=bs_env%soc_window_virt)
       CALL section_vals_val_get(soc_sec, "SOC_WINDOW_SMEARING", r_val=bs_env%soc_window_smearing)
+
+      CALL section_vals_val_get(soc_sec, "SOC_NBANDS_OCC", i_val=bs_env%soc_nbands_occ)
+      CALL section_vals_val_get(soc_sec, "SOC_NBANDS_VIRT", i_val=bs_env%soc_nbands_virt)
 
       NULLIFY (dos_pdos_sec)
       dos_pdos_sec => section_vals_get_subs_vals(bs_sec, "DOS")
@@ -254,12 +377,16 @@ CONTAINS
       CALL section_vals_val_get(floquet_sec, "POLARISATION", r_vals=bs_env%floquet_polarisation)
       CALL section_vals_val_get(floquet_sec, "PHASE_OFFSETS", r_vals=bs_env%floquet_phi)
       CALL section_vals_val_get(floquet_sec, "MAX_FLOQUET_INDEX", i_val=bs_env%max_floquet_index)
+      CALL section_vals_val_get(floquet_sec, "MAX_NMO", i_val=bs_env%max_nmo_floquet)
       CALL section_vals_val_get(floquet_sec, "EPS_FLOQUET", r_val=bs_env%eps_floquet)
       CALL section_vals_val_get(floquet_sec, "ENERGY_WINDOW", r_val=bs_env%energy_window_floquet)
       CALL section_vals_val_get(floquet_sec, "ENERGY_STEP", r_val=bs_env%energy_step_floquet)
       CALL section_vals_val_get(floquet_sec, "BROADENING", r_val=bs_env%broadening_floquet)
+      CALL section_vals_val_get(floquet_sec, "MEM_FILL_FRACTION", r_val=bs_env%floquet_mem_fill_fraction)
+      CALL section_vals_val_get(floquet_sec, "TEMPERATURE", r_val=bs_env%floquet_temperature)
       CALL section_vals_val_get(floquet_sec, "FLOQUET_DOS_FILE_NAME", c_val=bs_env%floquet_dos_file)
       CALL section_vals_val_get(floquet_sec, "QUASI_ENERGIES_FILE_NAME", c_val=bs_env%floquet_qe_file)
+      CALL section_vals_val_get(floquet_sec, "FLOQUET_BS_FILE_NAME", c_val=bs_env%floquet_bs_file)
 
       ! read special points for band structure
       ALLOCATE (bs_env%xkp_special(3, bs_env%input_kp_bs_n_sp_pts))
@@ -397,6 +524,7 @@ CONTAINS
       bs_env%nkp_only_DOS = nkp_only_DOS
 
       ALLOCATE (kpoints%xkp(3, nkp), kpoints%wkp(nkp))
+      kpoints%wkp(:) = 0.0_dp
       kpoints%wkp(1:nkp_only_DOS) = 1.0_dp/REAL(nkp_only_DOS, KIND=dp)
 
       CALL compute_xkp(kpoints%xkp, 1, nkp_only_DOS, nkp_grid)
@@ -420,7 +548,7 @@ CONTAINS
 
       u = bs_env%unit_nr
 
-      IF (u > 0) THEN
+      IF (u > 0 .AND. bs_env%do_periodic) THEN
          IF (nkp_only_bs > 0) THEN
             WRITE (u, FMT="(T2,1A,T77,I4)") &
                "Number of special k-points for the bandstructure", n_special_kp
@@ -614,12 +742,14 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_cfm_mo_coeff_kp_and_eigenval_scf_kp'
 
-      INTEGER                                            :: handle, ikp, ispin, nkp_bs_and_DOS
+      INTEGER                                            :: handle, ikp, ispin, nkp_bs_and_DOS, &
+                                                            nmo_retained
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index_scf
       REAL(KIND=dp)                                      :: CBM, VBM
       REAL(KIND=dp), DIMENSION(3)                        :: xkp
       TYPE(cp_cfm_type)                                  :: cfm_ks, cfm_mos, cfm_s
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks, matrix_s
+      TYPE(kpoint_env_type), POINTER                     :: lowdin_kp
       TYPE(kpoint_type), POINTER                         :: kpoints_scf
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: sab_nl
@@ -631,7 +761,10 @@ CONTAINS
                       matrix_s_kp=matrix_s, &
                       kpoints=kpoints_scf)
 
-      NULLIFY (sab_nl)
+      NULLIFY (sab_nl, lowdin_kp)
+      IF (ALLOCATED(kpoints_scf%lowdin_v)) THEN
+         IF (ANY(kpoints_scf%lowdin_v /= 0.0_dp)) ALLOCATE (lowdin_kp)
+      END IF
       CALL get_kpoint_info(kpoints_scf, sab_nl=sab_nl, cell_to_index=cell_to_index_scf)
 
       CALL cp_cfm_create(cfm_ks, bs_env%cfm_work_mo%matrix_struct)
@@ -641,8 +774,8 @@ CONTAINS
       ! nkp_bs_and_DOS contains desymmetrized k-point mesh from SCF and k-points from GW bandstructure
       nkp_bs_and_DOS = bs_env%nkp_bs_and_DOS
 
-      ALLOCATE (bs_env%eigenval_G0W0(bs_env%n_ao, nkp_bs_and_DOS, bs_env%n_spin))
-      ALLOCATE (bs_env%eigenval_HF(bs_env%n_ao, nkp_bs_and_DOS, bs_env%n_spin))
+      CALL allocate_GW_eigenvalues(bs_env)
+
       ALLOCATE (bs_env%cfm_mo_coeff_kp(nkp_bs_and_DOS, bs_env%n_spin))
       ALLOCATE (bs_env%cfm_ks_kp(nkp_bs_and_DOS, bs_env%n_spin))
       ALLOCATE (bs_env%cfm_s_kp(nkp_bs_and_DOS))
@@ -654,34 +787,44 @@ CONTAINS
       CALL cp_cfm_create(bs_env%cfm_s_kp(ikp), bs_env%cfm_work_mo%matrix_struct)
       END DO
 
-      DO ispin = 1, bs_env%n_spin
-         DO ikp = 1, nkp_bs_and_DOS
+      DO ikp = 1, nkp_bs_and_DOS
 
-            xkp(1:3) = bs_env%kpoints_DOS%xkp(1:3, ikp)
+         xkp(1:3) = bs_env%kpoints_DOS%xkp(1:3, ikp)
 
+         ! S(k) and its Lowdin projectors are shared by both spin channels.
+         CALL rsmat_to_kp(matrix_s, 1, xkp, cell_to_index_scf, sab_nl, bs_env, cfm_s)
+         CALL cp_cfm_to_cfm(cfm_s, bs_env%cfm_s_kp(ikp))
+         IF (ASSOCIATED(lowdin_kp)) THEN
+            CALL lowdin_kp_prepare(lowdin_kp, kpoints_scf%lowdin_orbitals, .FALSE., cfm_s)
+         END IF
+         DO ispin = 1, bs_env%n_spin
             ! h^KS^R -> h^KS(k)
             CALL rsmat_to_kp(matrix_ks, ispin, xkp, cell_to_index_scf, sab_nl, bs_env, cfm_ks)
-
-            ! S^R -> S(k)
-            CALL rsmat_to_kp(matrix_s, 1, xkp, cell_to_index_scf, sab_nl, bs_env, cfm_s)
+            IF (ASSOCIATED(lowdin_kp)) THEN
+               CALL lowdin_kp_apply(lowdin_kp, kpoints_scf%lowdin_v(:, ispin), cmat=cfm_ks)
+            END IF
 
             ! we store the complex KS matrix as fm matrix because the infrastructure for fm is
             ! much nicer compared to cfm
             CALL cp_cfm_to_cfm(cfm_ks, bs_env%cfm_ks_kp(ikp, ispin))
-            CALL cp_cfm_to_cfm(cfm_s, bs_env%cfm_s_kp(ikp))
+            CALL cp_cfm_to_cfm(bs_env%cfm_s_kp(ikp), cfm_s)
 
             ! Diagonalize KS-matrix via Rothaan-Hall equation:
             ! H^KS(k) C(k) = S(k) C(k) ε(k)
             CALL cp_cfm_geeig_canon(cfm_ks, cfm_s, cfm_mos, &
                                     bs_env%eigenval_scf(:, ikp, ispin), &
-                                    bs_env%cfm_work_mo, bs_env%eps_eigval_mat_s)
+                                    bs_env%cfm_work_mo, bs_env%eps_eigval_mat_s, &
+                                    nmo_retained=nmo_retained)
+            bs_env%n_mo_retained = MIN(bs_env%n_mo_retained, nmo_retained)
 
             ! we store the complex MO coeff as fm matrix because the infrastructure for fm is
             ! much nicer compared to cfm
             CALL cp_cfm_to_cfm(cfm_mos, bs_env%cfm_mo_coeff_kp(ikp, ispin))
 
          END DO
+      END DO
 
+      DO ispin = 1, bs_env%n_spin
          VBM = MAXVAL(bs_env%eigenval_scf(bs_env%n_occ(ispin), :, ispin))
          CBM = MINVAL(bs_env%eigenval_scf(bs_env%n_occ(ispin) + 1, :, ispin))
 
@@ -694,6 +837,12 @@ CONTAINS
       CALL cp_cfm_release(cfm_ks)
       CALL cp_cfm_release(cfm_s)
       CALL cp_cfm_release(cfm_mos)
+      IF (ASSOCIATED(lowdin_kp)) THEN
+         CALL cp_cfm_release(lowdin_kp%lowdin_cb)
+         CALL cp_cfm_release(lowdin_kp%lowdin_cwork)
+         CALL lowdin_kp%lowdin_gemm%destroy()
+         DEALLOCATE (lowdin_kp)
+      END IF
 
       CALL timestop(handle)
 
@@ -773,7 +922,7 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'diagonalize_ks_matrix'
 
-      INTEGER                                            :: handle, ikp, ispin
+      INTEGER                                            :: handle, ikp, ispin, nmo_retained
       REAL(KIND=dp)                                      :: CBM, VBM
 
       CALL timeset(routineN, handle)
@@ -793,13 +942,13 @@ CONTAINS
                                 bs_env%fm_mo_coeff_Gamma(ispin), &
                                 bs_env%eigenval_scf_Gamma(:, ispin), &
                                 bs_env%fm_work_mo(3), &
-                                bs_env%eps_eigval_mat_s)
+                                bs_env%eps_eigval_mat_s, &
+                                nmo_retained=nmo_retained)
+         bs_env%n_mo_retained = MIN(bs_env%n_mo_retained, nmo_retained)
 
          VBM = bs_env%eigenval_scf_Gamma(bs_env%n_occ(ispin), ispin)
          CBM = bs_env%eigenval_scf_Gamma(bs_env%n_occ(ispin) + 1, ispin)
 
-         bs_env%band_edges_scf_Gamma(ispin)%VBM = VBM
-         bs_env%band_edges_scf_Gamma(ispin)%CBM = CBM
          bs_env%e_fermi(ispin) = 0.5_dp*(VBM + CBM)
 
       END DO
@@ -880,8 +1029,10 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'get_parameters_from_qs_env'
 
-      INTEGER                                            :: color_sub, handle, homo, n_ao, n_atom, u
+      INTEGER                                            :: color_sub, handle, homo, n_ao, n_atom, &
+                                                            nelectron, u
       INTEGER, DIMENSION(3)                              :: periodic
+      REAL(KIND=dp)                                      :: maxocc
       REAL(KIND=dp), DIMENSION(3, 3)                     :: hmat
       TYPE(cell_type), POINTER                           :: cell
       TYPE(dft_control_type), POINTER                    :: dft_control
@@ -902,19 +1053,47 @@ CONTAINS
       IF (bs_env%n_spin == 1) bs_env%spin_degeneracy = 2.0_dp
       IF (bs_env%n_spin == 2) bs_env%spin_degeneracy = 1.0_dp
 
-      CALL get_mo_set(mo_set=mos(1), nao=n_ao, homo=homo)
+      CALL get_mo_set(mo_set=mos(1), nao=n_ao, homo=homo, nelectron=nelectron, maxocc=maxocc)
       bs_env%n_ao = n_ao
+      bs_env%n_occ_nosmear(1:2) = NINT(nelectron/maxocc) !fix for moire large-cell Gamma
+      bs_env%n_electron(1:2) = nelectron
+      ! lowered by the diagonalization below if the canonical orthogonalization removes modes
+      bs_env%n_mo_retained = n_ao
       bs_env%n_occ(1:2) = homo
       bs_env%n_vir(1:2) = n_ao - homo
-
       IF (bs_env%n_spin == 2) THEN
-         CALL get_mo_set(mo_set=mos(2), homo=homo)
+         CALL get_mo_set(mo_set=mos(2), homo=homo, nelectron=nelectron, maxocc=maxocc)
+         bs_env%n_occ_nosmear(2) = NINT(nelectron/maxocc)
          bs_env%n_occ(2) = homo
          bs_env%n_vir(2) = n_ao - homo
+         bs_env%n_electron(2) = nelectron
       END IF
-
       bs_env%eps_eigval_mat_s = scf_control%eps_eigval
-
+      ! reuse the ground-state SCF's &SMEAR settings (if any) for the metal-capable Fermi
+      ! level search (get_fermi_level_1c/2c); SMEAR_ENERGY_WINDOW and SMEAR_LIST are not
+      ! supported by Smearkp/Smearkp2, so fall back to the T=0 bisection for those
+      bs_env%do_smear = .FALSE.
+      bs_env%smear_method = smear_fermi_dirac
+      bs_env%smear_width = 0.0_dp
+      IF (scf_control%smear%do_smear) THEN
+         SELECT CASE (scf_control%smear%method)
+         CASE (smear_fermi_dirac)
+            bs_env%do_smear = .TRUE.
+            bs_env%smear_method = smear_fermi_dirac
+            bs_env%smear_width = scf_control%smear%electronic_temperature
+         CASE (smear_gaussian, smear_mp, smear_mv)
+            bs_env%do_smear = .TRUE.
+            bs_env%smear_method = scf_control%smear%method
+            bs_env%smear_width = scf_control%smear%smearing_width
+         CASE DEFAULT
+            IF (bs_env%unit_nr > 0) THEN
+               WRITE (bs_env%unit_nr, '(T2,A)') &
+                  'SMEAR method not supported for the post-SCF Fermi level search, '// &
+                  'falling back to a T=0 bisection.'
+            END IF
+         END SELECT
+      END IF
+      CPASSERT(scf_control%smear%fixed_mag_mom <= 0.0_dp)
       ! get para_env from qs_env (bs_env%para_env is identical to para_env in qs_env)
       CALL get_qs_env(qs_env, para_env=para_env)
       color_sub = 0
@@ -929,23 +1108,28 @@ CONTAINS
       CALL get_qs_env(qs_env=qs_env, cell=cell)
       CALL get_cell(cell=cell, periodic=periodic, h=hmat)
       bs_env%periodic(1:3) = periodic(1:3)
+      bs_env%do_periodic = ANY(bs_env%periodic /= 0)
       bs_env%hmat(1:3, 1:3) = hmat
       bs_env%nimages_scf = dft_control%nimages
       IF (dft_control%nimages == 1) THEN
          IF (bs_env%do_gw_ri_rs) THEN
-            IF (ANY(periodic /= 0)) THEN
-               bs_env%small_cell_full_kp_or_large_cell_Gamma = large_cell_Gamma_ri_rs
+            IF (bs_env%do_periodic) THEN
+               bs_env%gw_implementation = ri_rs_large_cell_Gamma
             ELSE
-               bs_env%small_cell_full_kp_or_large_cell_Gamma = non_periodic_ri_rs
+               bs_env%gw_implementation = ri_rs_non_periodic
             END IF
+         ELSE IF (bs_env%do_static_cohsex) THEN
+            bs_env%gw_implementation = tensor_static_cohsex
          ELSE
-            bs_env%small_cell_full_kp_or_large_cell_Gamma = large_cell_Gamma
+            bs_env%gw_implementation = tensor_large_cell_Gamma
          END IF
       ELSE IF (dft_control%nimages > 1) THEN
          IF (bs_env%do_gw_ri_rs) THEN
             CPABORT("RI-RS Not Implemented for K-point Calculations")
+         ELSE IF (bs_env%do_static_cohsex) THEN
+            CPABORT("COHSEX Not Implemented for K-point Calculations")
          ELSE
-            bs_env%small_cell_full_kp_or_large_cell_Gamma = small_cell_full_kp
+            bs_env%gw_implementation = tensor_small_cell_full_kp
          END IF
       ELSE
          CPABORT("Wrong number of cells from DFT calculation.")
@@ -963,7 +1147,7 @@ CONTAINS
          WRITE (u, FMT="(T2,2A,T73,I8)") "Number of unoccupied (= virtual) MOs ", &
             "= Number of unoccupied bands", n_ao - homo
          WRITE (u, FMT="(T2,A,T73,I8)") "Number of Gaussian basis functions for MOs", n_ao
-         IF (bs_env%small_cell_full_kp_or_large_cell_Gamma == small_cell_full_kp) THEN
+         IF (bs_env%gw_implementation == tensor_small_cell_full_kp) THEN
             WRITE (u, FMT="(T2,2A,T73,I8)") "Number of cells considered in the DFT ", &
                "calculation", bs_env%nimages_scf
          END IF
@@ -1061,18 +1245,18 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'eval_bandstructure_properties'
 
+      CHARACTER(LEN=default_string_length)               :: gw_label, gw_soc_label
       INTEGER                                            :: handle, homo, homo_1, homo_2, &
                                                             homo_spinor, ikp, ikp_for_file, ispin, &
                                                             n_ao, n_E, nkind, nkp
       LOGICAL                                            :: is_bandstruc_kpoint, print_DOS_kpoints, &
                                                             print_ikp
-      REAL(KIND=dp)                                      :: broadening, E_max, E_max_G0W0, E_min, &
-                                                            E_min_G0W0, E_total_window, &
-                                                            energy_step_DOS, energy_window_DOS, t1
+      REAL(KIND=dp) :: broadening, E_max, E_max_G0W0, E_min, E_min_G0W0, E_total_window, &
+         energy_step_DOS, energy_window_DOS, n_el_spinor, t1
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:) :: DOS_G0W0, DOS_G0W0_SOC, DOS_scf, DOS_scf_SOC, &
          eigenval, eigenval_spinor, eigenval_spinor_G0W0, eigenval_spinor_no_SOC
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: PDOS_G0W0, PDOS_G0W0_SOC, PDOS_scf, &
-                                                            PDOS_scf_SOC, proj_mo_on_kind
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :) :: eigenval_spinor_all_gw, &
+         eigenval_spinor_all_scf, PDOS_G0W0, PDOS_G0W0_SOC, PDOS_scf, PDOS_scf_SOC, proj_mo_on_kind
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: LDOS_G0W0_2d, LDOS_scf_2d, &
                                                             LDOS_scf_2d_SOC
       TYPE(band_edges_type)                              :: band_edges_G0W0, band_edges_G0W0_SOC, &
@@ -1093,7 +1277,7 @@ CONTAINS
 
       ! if we have done GW or a full kpoint SCF, we already have the band edges
       IF (bs_env%do_gw .OR. &
-          bs_env%small_cell_full_kp_or_large_cell_Gamma == small_cell_full_kp) THEN
+          bs_env%gw_implementation == tensor_small_cell_full_kp) THEN
          band_edges_scf = bs_env%band_edges_scf
          band_edges_scf_guess = band_edges_scf
       ELSE
@@ -1121,7 +1305,7 @@ CONTAINS
       E_max = band_edges_scf_guess%CBM + 0.5_dp*energy_window_DOS
 
       IF (bs_env%do_gw) THEN
-         band_edges_G0W0 = bs_env%band_edges_G0W0
+         band_edges_G0W0 = bs_env%band_edges_GW
          E_min_G0W0 = band_edges_G0W0%VBM - 0.5_dp*energy_window_DOS
          E_max_G0W0 = band_edges_G0W0%CBM + 0.5_dp*energy_window_DOS
          E_min = MIN(E_min, E_min_G0W0)
@@ -1141,6 +1325,16 @@ CONTAINS
       ALLOCATE (eigenval_spinor(2*n_ao))
       ALLOCATE (eigenval_spinor_no_SOC(2*n_ao))
       ALLOCATE (eigenval_spinor_G0W0(2*n_ao))
+
+      ! collect the SOC spinor eigenvalues of every DOS k-point (band-structure-path
+      ! k-points are included but carry wkp=0, see get_fermi_level_1c) to later obtain
+      ! the SCF+SOC (and, if requested, G0W0+SOC) Fermi level from get_fermi_level_1c
+      IF (bs_env%do_soc) THEN
+         ALLOCATE (eigenval_spinor_all_scf(2*n_ao, bs_env%nkp_bs_and_DOS))
+         IF (bs_env%do_gw) THEN
+            ALLOCATE (eigenval_spinor_all_gw(2*n_ao, bs_env%nkp_bs_and_DOS))
+         END IF
+      END IF
 
       IF (bs_env%do_dos_pdos) THEN
 
@@ -1193,6 +1387,13 @@ CONTAINS
 
          homo_spinor = bs_env%n_occ(1) + bs_env%n_occ(bs_env%n_spin)
 
+         SELECT CASE (bs_env%n_spin)
+         CASE (1)
+            n_el_spinor = REAL(bs_env%n_electron(1), KIND=dp)
+         CASE (2)
+            n_el_spinor = REAL(bs_env%n_electron(1) + bs_env%n_electron(2), KIND=dp)
+         END SELECT
+
          band_edges_scf_SOC%VBM = -1000.0_dp
          band_edges_scf_SOC%CBM = 1000.0_dp
          band_edges_scf_SOC%DBG = 1000.0_dp
@@ -1230,11 +1431,7 @@ CONTAINS
          CPASSERT(bs_env%int_ldos_xyz == int_ldos_z)
       END IF
 
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(A)') ''
-      END IF
-
-      IF (bs_env%small_cell_full_kp_or_large_cell_Gamma == small_cell_full_kp) THEN
+      IF (bs_env%gw_implementation == tensor_small_cell_full_kp) THEN
          CALL cp_cfm_create(cfm_ks_ikp, bs_env%cfm_ks_kp(1, 1)%matrix_struct)
          CALL cp_cfm_create(cfm_s_ikp, bs_env%cfm_ks_kp(1, 1)%matrix_struct)
       END IF
@@ -1245,8 +1442,8 @@ CONTAINS
 
          DO ispin = 1, bs_env%n_spin
 
-            SELECT CASE (bs_env%small_cell_full_kp_or_large_cell_Gamma)
-            CASE (large_cell_Gamma, large_cell_Gamma_ri_rs, non_periodic_ri_rs)
+            SELECT CASE (bs_env%gw_implementation)
+            CASE (tensor_large_cell_Gamma, ri_rs_large_cell_Gamma, ri_rs_non_periodic, tensor_static_cohsex)
 
                ! 1. get H^KS_µν(k_i) from H^KS_µν(k=0)
                CALL cfm_ikp_from_fm_Gamma(cfm_ks_ikp, bs_env%fm_ks_Gamma(ispin), &
@@ -1261,7 +1458,9 @@ CONTAINS
                CALL cp_cfm_geeig(cfm_ks_ikp, cfm_s_ikp_copy, cfm_mos_ikp(ispin), &
                                  eigenval, cfm_work_ikp)
 
-            CASE (small_cell_full_kp)
+               bs_env%eigenval_scf(:, ikp, ispin) = eigenval(:)
+
+            CASE (tensor_small_cell_full_kp)
 
                ! 1. get H^KS_µν(k_i)
                CALL cp_cfm_to_cfm(bs_env%cfm_ks_kp(ikp, ispin), cfm_ks_ikp)
@@ -1285,7 +1484,7 @@ CONTAINS
                                     proj_mo_on_kind)
 
                IF (bs_env%do_gw) THEN
-                  CALL add_to_DOS_PDOS(DOS_G0W0, PDOS_G0W0, bs_env%eigenval_G0W0(:, ikp, ispin), &
+                  CALL add_to_DOS_PDOS(DOS_G0W0, PDOS_G0W0, bs_env%eigenval_GW(:, ikp, ispin), &
                                        ikp, bs_env, n_E, E_min, proj_mo_on_kind)
                END IF
             END IF
@@ -1296,7 +1495,7 @@ CONTAINS
 
                IF (bs_env%do_gw) THEN
                   CALL add_to_LDOS_2d(LDOS_G0W0_2d, qs_env, ikp, bs_env, cfm_mos_ikp(ispin), &
-                                      bs_env%eigenval_G0W0(:, ikp, 1), band_edges_G0W0)
+                                      bs_env%eigenval_GW(:, ikp, 1), band_edges_G0W0)
                END IF
 
             END IF
@@ -1330,7 +1529,7 @@ CONTAINS
             CALL SOC_ev(bs_env, qs_env, ikp, bs_env%eigenval_scf, &
                         E_min, cfm_mos_ikp, DOS_scf_SOC, PDOS_scf_SOC, &
                         band_edges_scf_SOC, eigenval_spinor, cfm_spinor_wf_ikp)
-
+            eigenval_spinor_all_scf(:, ikp) = eigenval_spinor
             IF (.NOT. bs_env%do_gw .AND. print_ikp) THEN
                CALL write_SOC_eigenvalues(eigenval_spinor, ikp_for_file, ikp, bs_env)
             END IF
@@ -1343,10 +1542,10 @@ CONTAINS
             IF (bs_env%do_gw) THEN
 
                ! compute G0W0+SOC eigenvalues; based on these, compute band edges, DOS and LDOS
-               CALL SOC_ev(bs_env, qs_env, ikp, bs_env%eigenval_G0W0, &
+               CALL SOC_ev(bs_env, qs_env, ikp, bs_env%eigenval_GW, &
                            E_min, cfm_mos_ikp, DOS_G0W0_SOC, PDOS_G0W0_SOC, &
                            band_edges_G0W0_SOC, eigenval_spinor_G0W0, cfm_spinor_wf_ikp)
-
+               eigenval_spinor_all_gw(:, ikp) = eigenval_spinor_G0W0
                IF (print_ikp) THEN
                   ! write SCF+SOC and G0W0+SOC eigenvalues to file
                   ! SCF_and_G0W0_band_structure_for_kpoint_<ikp>_+_SOC
@@ -1367,10 +1566,34 @@ CONTAINS
       END DO ! ikp_DOS
 
       band_edges_scf%IDBG = band_edges_scf%CBM - band_edges_scf%VBM
+
+      SELECT CASE (bs_env%n_spin)
+      CASE (1)
+         CALL get_fermi_level_1c(bs_env, bs_env%eigenval_scf(:, :, 1), &
+                                 REAL(bs_env%n_electron(1), KIND=dp), &
+                                 bs_env%spin_degeneracy, band_edges_scf%VBM, &
+                                 band_edges_scf%CBM, band_edges_scf%E_fermi)
+      CASE (2)
+         CALL get_fermi_level_2c(bs_env, bs_env%eigenval_scf(:, :, 1:2), &
+                                 REAL(bs_env%n_electron(1) + bs_env%n_electron(2), KIND=dp), &
+                                 band_edges_scf%VBM, band_edges_scf%CBM, band_edges_scf%E_fermi)
+      END SELECT
+
       IF (bs_env%do_soc) THEN
          band_edges_scf_SOC%IDBG = band_edges_scf_SOC%CBM - band_edges_scf_SOC%VBM
+         ! SOC merges both spins into 2*n_ao spinor states, each holding at most one
+         ! electron (maxocc=1); homo_spinor = n_occ(1)+n_occ(n_spin) is the total spinor
+         ! electron count, same quantity SOC_ev uses to locate the occupied/unoccupied edge
+         CALL get_fermi_level_1c(bs_env, eigenval_spinor_all_scf, &
+                                 n_el_spinor, 1.0_dp, &
+                                 band_edges_scf_SOC%VBM, band_edges_scf_SOC%CBM, band_edges_scf_SOC%E_fermi)
+
          IF (bs_env%do_gw) THEN
             band_edges_G0W0_SOC%IDBG = band_edges_G0W0_SOC%CBM - band_edges_G0W0_SOC%VBM
+            CALL get_fermi_level_1c(bs_env, eigenval_spinor_all_gw, &
+                                    n_el_spinor, 1.0_dp, &
+                                    band_edges_G0W0_SOC%VBM, band_edges_G0W0_SOC%CBM, band_edges_G0W0_SOC%E_fermi)
+
          END IF
       END IF
 
@@ -1396,8 +1619,13 @@ CONTAINS
          END IF
       END IF
 
+      ! the printed band edges carry the GW flavour that was actually run; the labels handed to
+      ! write_dos_pdos / print_LDOS_main below become file names and stay as they are
+      gw_label = gw_flavour_label(bs_env)
+      gw_soc_label = TRIM(gw_label)//"+SOC"
+
       IF (bs_env%do_gw) THEN
-         CALL write_band_edges(band_edges_G0W0, "G0W0", bs_env)
+         CALL write_band_edges(band_edges_G0W0, TRIM(gw_label), bs_env)
          CALL write_band_edges(bs_env%band_edges_HF, "Hartree-Fock with SCF orbitals", bs_env)
          IF (bs_env%do_dos_pdos) THEN
             CALL write_dos_pdos(DOS_G0W0, PDOS_G0W0, bs_env, qs_env, "G0W0", E_min, &
@@ -1409,7 +1637,7 @@ CONTAINS
       END IF
 
       IF (bs_env%do_soc .AND. bs_env%do_gw) THEN
-         CALL write_band_edges(band_edges_G0W0_SOC, "G0W0+SOC", bs_env)
+         CALL write_band_edges(band_edges_G0W0_SOC, TRIM(gw_soc_label), bs_env)
          IF (bs_env%do_dos_pdos) THEN
             CALL write_dos_pdos(DOS_G0W0_SOC, PDOS_G0W0_SOC, bs_env, qs_env, "G0W0_SOC", E_min, &
                                 band_edges_G0W0_SOC%VBM)
@@ -1665,7 +1893,7 @@ CONTAINS
 !> \param bs_env ...
 !> \param qs_env ...
 !> \param ikp ...
-!> \param eigenval_no_SOC ...
+!> \param eigenval_no_SOC non-SOC band energies (n_ao, n_kpoints, n_spin)
 !> \param E_min ...
 !> \param cfm_mos_ikp ...
 !> \param DOS ...
@@ -1691,14 +1919,64 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'SOC_ev'
 
+      INTEGER                                            :: handle
+      LOGICAL                                            :: do_truncate
+
+      CALL timeset(routineN, handle)
+
+      !for the window truncation part
+      do_truncate = (bs_env%soc_nbands_occ > 0 .AND. bs_env%soc_nbands_virt > 0)
+
+      IF (do_truncate) THEN
+         CALL SOC_ev_truncate_mos(bs_env, qs_env, ikp, eigenval_no_SOC, cfm_mos_ikp, &
+                                  band_edges, eigenval_spinor, cfm_spinor_wf_ikp)
+      ELSE
+         CALL SOC_ev_all_mos(bs_env, qs_env, ikp, eigenval_no_SOC, E_min, cfm_mos_ikp, &
+                             DOS, PDOS, band_edges, eigenval_spinor, cfm_spinor_wf_ikp)
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE SOC_ev
+
+! **************************************************************************************************
+!> \brief SOC second-variational diagonalization over the full 2*n_ao spinor space (no truncation
+!>        window) -- the SOC_NBANDS_OCC/VIRT-truncated path lives in SOC_ev_truncate_mos.
+!> \param bs_env ...
+!> \param qs_env ...
+!> \param ikp ...
+!> \param eigenval_no_SOC non-SOC band energies (n_ao, n_kpoints, n_spin)
+!> \param E_min ...
+!> \param cfm_mos_ikp ...
+!> \param DOS ...
+!> \param PDOS ...
+!> \param band_edges ...
+!> \param eigenval_spinor ...
+!> \param cfm_spinor_wf_ikp ...
+! **************************************************************************************************
+   SUBROUTINE SOC_ev_all_mos(bs_env, qs_env, ikp, eigenval_no_SOC, E_min, cfm_mos_ikp, &
+                             DOS, PDOS, band_edges, eigenval_spinor, cfm_spinor_wf_ikp)
+
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      INTEGER                                            :: ikp
+      REAL(KIND=dp), DIMENSION(:, :, :)                  :: eigenval_no_SOC
+      REAL(KIND=dp)                                      :: E_min
+      TYPE(cp_cfm_type), DIMENSION(2)                    :: cfm_mos_ikp
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: DOS
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: PDOS
+      TYPE(band_edges_type)                              :: band_edges
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenval_spinor
+      TYPE(cp_cfm_type)                                  :: cfm_spinor_wf_ikp
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'SOC_ev_all_mos'
+
       INTEGER                                            :: handle, homo_spinor, n_ao, n_E, nkind
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenval_spinor_no_SOC
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: proj_mo_on_kind_spinor
       TYPE(cp_cfm_type)                                  :: cfm_eigenvec_ikp_spinor, &
                                                             cfm_ks_ikp_spinor, cfm_mos_ikp_spinor, &
                                                             cfm_SOC_ikp_spinor, cfm_work_ikp_spinor
-
-!TYPE(band_edges_type)                              :: band_edges_no_SOC
 
       CALL timeset(routineN, handle)
 
@@ -1718,8 +1996,8 @@ CONTAINS
       proj_mo_on_kind_spinor(:, :) = 0.0_dp
 
       ! 1. get V^SOC_µν,σσ'(k_i)
-      SELECT CASE (bs_env%small_cell_full_kp_or_large_cell_Gamma)
-      CASE (large_cell_Gamma, large_cell_Gamma_ri_rs, non_periodic_ri_rs)
+      SELECT CASE (bs_env%gw_implementation)
+      CASE (tensor_large_cell_Gamma, ri_rs_large_cell_Gamma, ri_rs_non_periodic, tensor_static_cohsex)
 
          ! 1. get V^SOC_µν,σσ'(k_i) from V^SOC_µν,σσ'(k=0)
          CALL cfm_ikp_from_cfm_spinor_Gamma(cfm_SOC_ikp_spinor, &
@@ -1727,7 +2005,7 @@ CONTAINS
                                             bs_env%fm_s_Gamma%matrix_struct, &
                                             ikp, qs_env, bs_env%kpoints_DOS, "ORB")
 
-      CASE (small_cell_full_kp)
+      CASE (tensor_small_cell_full_kp)
 
          ! 1. V^SOC_µν,σσ'(k_i) already there
          CALL cp_cfm_to_cfm(bs_env%cfm_SOC_spinor_ao(ikp), cfm_SOC_ikp_spinor)
@@ -1786,6 +2064,7 @@ CONTAINS
                            - eigenval_spinor(homo_spinor))
 
       ! 8. spinor wavefunctions:
+      CALL cp_cfm_set_all(cfm_spinor_wf_ikp, z_zero)
       CALL parallel_gemm('N', 'N', 2*n_ao, 2*n_ao, 2*n_ao, z_one, &
                          cfm_mos_ikp_spinor, cfm_eigenvec_ikp_spinor, &
                          z_zero, cfm_spinor_wf_ikp)
@@ -1798,8 +2077,298 @@ CONTAINS
 
       CALL timestop(handle)
 
-   END SUBROUTINE SOC_ev
+   END SUBROUTINE SOC_ev_all_mos
 
+! **************************************************************************************************
+!> \brief SOC second-variational diagonalization truncated to a window of SOC_NBANDS_OCC occupied
+!>        and SOC_NBANDS_VIRT virtual states around the Fermi level -- the untruncated, full
+!>        2*n_ao spinor-space path lives in SOC_ev_all_mos.
+!> \param bs_env ...
+!> \param qs_env ...
+!> \param ikp ...
+!> \param eigenval_no_SOC non-SOC band energies (n_ao, n_kpoints, n_spin)
+!> \param cfm_mos_ikp ...
+!> \param band_edges ...
+!> \param eigenval_spinor ...
+!> \param cfm_spinor_wf_ikp ...
+! **************************************************************************************************
+   SUBROUTINE SOC_ev_truncate_mos(bs_env, qs_env, ikp, eigenval_no_SOC, cfm_mos_ikp, &
+                                  band_edges, eigenval_spinor, cfm_spinor_wf_ikp)
+
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      INTEGER                                            :: ikp
+      REAL(KIND=dp), DIMENSION(:, :, :)                  :: eigenval_no_SOC
+      TYPE(cp_cfm_type), DIMENSION(2)                    :: cfm_mos_ikp
+      TYPE(band_edges_type)                              :: band_edges
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenval_spinor
+      TYPE(cp_cfm_type)                                  :: cfm_spinor_wf_ikp
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'SOC_ev_truncate_mos'
+
+      INTEGER                                            :: handle, homo_spinor, homo_used, &
+                                                            mo_index_start_1, mo_index_start_2, &
+                                                            n_ao, n_window, n_window2tot, nkind, &
+                                                            nocc, nvirt
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eig_win_sorted, eigenval_spinor_no_SOC
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: proj_mo_on_kind_spinor
+      TYPE(cp_cfm_type)                                  :: cfm_eigenvec_ikp_spinor, &
+                                                            cfm_ks_ikp_spinor, cfm_mos_ikp_spinor, &
+                                                            cfm_SOC_ikp_spinor, cfm_work_ikp_spinor
+      TYPE(cp_fm_struct_type), POINTER                   :: fst_mos, fst_wa, fst_ww
+      TYPE(cp_fm_type)                                   :: fm_src_im, fm_src_re, fm_tgt_im, &
+                                                            fm_tgt_re
+
+      CALL timeset(routineN, handle)
+
+      n_ao = bs_env%n_ao
+      homo_spinor = bs_env%n_occ(1) + bs_env%n_occ(bs_env%n_spin)
+      CALL get_qs_env(qs_env, nkind=nkind)
+
+      nocc = bs_env%soc_nbands_occ
+      nvirt = bs_env%soc_nbands_virt
+      CPASSERT(nocc <= bs_env%n_occ_nosmear(1))
+      CPASSERT(nocc <= bs_env%n_occ_nosmear(bs_env%n_spin))
+      CPASSERT(nvirt <= n_ao - bs_env%n_occ_nosmear(1))
+      CPASSERT(nvirt <= n_ao - bs_env%n_occ_nosmear(bs_env%n_spin))
+      CPASSERT(.NOT. bs_env%do_dos_pdos)
+      mo_index_start_1 = bs_env%n_occ_nosmear(1) - nocc + 1
+      mo_index_start_2 = bs_env%n_occ_nosmear(bs_env%n_spin) - nocc + 1
+      n_window = nocc + nvirt
+      n_window2tot = 2*n_window
+      homo_used = 2*nocc
+
+      NULLIFY (fst_ww, fst_wa, fst_mos)
+      CALL cp_fm_struct_create(fst_ww, nrow_global=n_window2tot, ncol_global=n_window2tot, &
+                               template_fmstruct=bs_env%cfm_SOC_spinor_ao(1)%matrix_struct)
+      CALL cp_fm_struct_create(fst_wa, nrow_global=n_window2tot, ncol_global=2*n_ao, &
+                               template_fmstruct=bs_env%cfm_SOC_spinor_ao(1)%matrix_struct)
+      CALL cp_fm_struct_create(fst_mos, nrow_global=2*n_ao, ncol_global=n_window2tot, &
+                               template_fmstruct=bs_env%cfm_SOC_spinor_ao(1)%matrix_struct)
+      CALL cp_cfm_create(cfm_ks_ikp_spinor, fst_ww)
+      CALL cp_cfm_create(cfm_eigenvec_ikp_spinor, fst_ww)
+      CALL cp_cfm_create(cfm_work_ikp_spinor, fst_wa)
+      CALL cp_cfm_create(cfm_SOC_ikp_spinor, bs_env%cfm_SOC_spinor_ao(1)%matrix_struct)
+      CALL cp_cfm_create(cfm_mos_ikp_spinor, fst_mos)
+
+      ALLOCATE (eigenval_spinor_no_SOC(2*n_ao))
+      ALLOCATE (proj_mo_on_kind_spinor(2*n_ao, nkind))
+      ! PDOS not yet implemented -> projection is just zero -> PDOS is zero
+      proj_mo_on_kind_spinor(:, :) = 0.0_dp
+
+      ! 1. get V^SOC_µν,σσ'(k_i)
+      SELECT CASE (bs_env%gw_implementation)
+      CASE (tensor_large_cell_Gamma, ri_rs_large_cell_Gamma, ri_rs_non_periodic, tensor_static_cohsex)
+
+         ! 1. get V^SOC_µν,σσ'(k_i) from V^SOC_µν,σσ'(k=0)
+         CALL cfm_ikp_from_cfm_spinor_Gamma(cfm_SOC_ikp_spinor, &
+                                            bs_env%cfm_SOC_spinor_ao(1), &
+                                            bs_env%fm_s_Gamma%matrix_struct, &
+                                            ikp, qs_env, bs_env%kpoints_DOS, "ORB")
+
+      CASE (tensor_small_cell_full_kp)
+
+         ! 1. V^SOC_µν,σσ'(k_i) already there
+         CALL cp_cfm_to_cfm(bs_env%cfm_SOC_spinor_ao(ikp), cfm_SOC_ikp_spinor)
+
+      END SELECT
+
+      ! 2. V^SOC_nn',σσ'(k_i) = sum_µν C^*_µn,σ(k_i) V^SOC_µν,σσ'(k_i) C_νn'(k_i),
+      !    C_µn,σ(k_i): MO coefficiencts from diagonalizing KS-matrix h^KS_nn',σσ'(k_i)
+
+      ! 2.1 build matrix C_µn,σ(k_i)
+      CALL cp_cfm_set_all(cfm_mos_ikp_spinor, z_zero)
+      ! get_cfm_submat/add_cfm_submat only copy SQUARE blocks, so the rectangular
+      ! (n_ao x n_window) column windows are copied with cp_fm_to_fm_submat (separate
+      ! nrow/ncol) on the real and imaginary parts separately, then recombined.
+      CALL cp_fm_create(fm_src_re, cfm_mos_ikp(1)%matrix_struct)
+      CALL cp_fm_create(fm_src_im, cfm_mos_ikp(1)%matrix_struct)
+      CALL cp_fm_create(fm_tgt_re, fst_mos)
+      CALL cp_fm_create(fm_tgt_im, fst_mos)
+      CALL cp_fm_set_all(fm_tgt_re, 0.0_dp)
+      CALL cp_fm_set_all(fm_tgt_im, 0.0_dp)
+      ! spin 1: MO columns mo_index_start_1..mo_index_start_1+n_window-1 -> rows 1..n_ao, cols 1..n_window
+      CALL cp_cfm_to_fm(cfm_mos_ikp(1), fm_src_re, fm_src_im)
+      CALL cp_fm_to_fm_submat(msource=fm_src_re, mtarget=fm_tgt_re, nrow=n_ao, ncol=n_window, &
+                              s_firstrow=1, s_firstcol=mo_index_start_1, t_firstrow=1, t_firstcol=1)
+      CALL cp_fm_to_fm_submat(msource=fm_src_im, mtarget=fm_tgt_im, nrow=n_ao, ncol=n_window, &
+                              s_firstrow=1, s_firstcol=mo_index_start_1, t_firstrow=1, t_firstcol=1)
+
+      ! spin 2: MO columns mo_index_start_2..mo_index_start_2+n_window-1 -> rows n_ao+1..2*n_ao, cols n_window+1..2*n_window
+      CALL cp_cfm_to_fm(cfm_mos_ikp(bs_env%n_spin), fm_src_re, fm_src_im)
+      CALL cp_fm_to_fm_submat(msource=fm_src_re, mtarget=fm_tgt_re, nrow=n_ao, ncol=n_window, &
+                              s_firstrow=1, s_firstcol=mo_index_start_2, t_firstrow=n_ao + 1, t_firstcol=n_window + 1)
+      CALL cp_fm_to_fm_submat(msource=fm_src_im, mtarget=fm_tgt_im, nrow=n_ao, ncol=n_window, &
+                              s_firstrow=1, s_firstcol=mo_index_start_2, t_firstrow=n_ao + 1, t_firstcol=n_window + 1)
+
+      CALL cp_fm_to_cfm(fm_tgt_re, fm_tgt_im, cfm_mos_ikp_spinor)
+
+      CALL cp_fm_release(fm_src_re)
+      CALL cp_fm_release(fm_src_im)
+      CALL cp_fm_release(fm_tgt_re)
+      CALL cp_fm_release(fm_tgt_im)
+
+      ! 2.2 work_nν,σσ' = sum_µ C^*_µn,σ(k_i) V^SOC_µν,σσ'(k_i)
+      CALL parallel_gemm('C', 'N', n_window2tot, 2*n_ao, 2*n_ao, z_one, &
+                         cfm_mos_ikp_spinor, cfm_SOC_ikp_spinor, &
+                         z_zero, cfm_work_ikp_spinor)
+      ! 2.3 V^SOC_nn',σσ'(k_i) = sum_ν work_nν,σσ' C_νn'(k_i)
+      CALL parallel_gemm('N', 'N', n_window2tot, n_window2tot, 2*n_ao, z_one, &
+                         cfm_work_ikp_spinor, cfm_mos_ikp_spinor, &
+                         z_zero, cfm_ks_ikp_spinor)
+
+      ! 3. remove SOC outside of energy window: not applicable here -- the truncation window
+      !    itself already restricts SOC to the states around the Fermi level
+      eigenval_spinor_no_SOC(1:n_ao) = eigenval_no_SOC(1:n_ao, ikp, 1)
+      eigenval_spinor_no_SOC(n_ao + 1:) = eigenval_no_SOC(1:n_ao, ikp, bs_env%n_spin)
+
+      ! 4. h^G0W0+SOC_nn',σσ'(k_i) = ε_nσ^G0W0(k_i) δ_nn' δ_σσ' + V^SOC_nn',σσ'(k_i)
+      CALL cfm_add_on_diag(cfm_ks_ikp_spinor, &
+                           [eigenval_no_SOC(mo_index_start_1:mo_index_start_1 + n_window - 1, ikp, 1), &
+                            eigenval_no_SOC(mo_index_start_2:mo_index_start_2 + n_window - 1, ikp, bs_env%n_spin)])
+
+      ! 5. diagonalize h^G0W0+SOC_nn',σσ'(k_i) to get eigenvalues
+      ALLOCATE (eig_win_sorted(n_window2tot))
+      CALL cp_cfm_heevd(cfm_ks_ikp_spinor, cfm_eigenvec_ikp_spinor, eig_win_sorted)
+
+      ! 6. DOS from spinors: not supported for the truncated window (CPASSERT'd above)
+
+      ! 7. valence band max. (VBM), conduction band min. (CBM) and direct bandgap (DBG)
+      band_edges%VBM = MAX(band_edges%VBM, eig_win_sorted(homo_used))
+      band_edges%CBM = MIN(band_edges%CBM, eig_win_sorted(homo_used + 1))
+      band_edges%DBG = MIN(band_edges%DBG, eig_win_sorted(homo_used + 1) - eig_win_sorted(homo_used))
+
+      CALL fill_truncated_eigenval_spinor(eigenval_no_SOC, eig_win_sorted, ikp, bs_env%n_spin, &
+                                          n_ao, mo_index_start_1, mo_index_start_2, n_window, &
+                                          n_window2tot, eigenval_spinor)
+
+      ! 8. spinor wavefunctions:
+      CALL cp_cfm_set_all(cfm_spinor_wf_ikp, z_zero)
+      CPASSERT(.NOT. bs_env%do_ldos)
+      CALL parallel_gemm('N', 'N', 2*n_ao, n_window2tot, n_window2tot, z_one, &
+                         cfm_mos_ikp_spinor, cfm_eigenvec_ikp_spinor, &
+                         z_zero, cfm_spinor_wf_ikp)
+
+      CALL cp_cfm_release(cfm_ks_ikp_spinor)
+      CALL cp_cfm_release(cfm_SOC_ikp_spinor)
+      CALL cp_cfm_release(cfm_work_ikp_spinor)
+      CALL cp_cfm_release(cfm_eigenvec_ikp_spinor)
+      CALL cp_cfm_release(cfm_mos_ikp_spinor)
+
+      CALL cp_fm_struct_release(fst_ww)
+      CALL cp_fm_struct_release(fst_wa)
+      CALL cp_fm_struct_release(fst_mos)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE SOC_ev_truncate_mos
+! **************************************************************************************************
+!> \brief ...
+!> \param eigenval_no_SOC non-SOC band energies (n_ao, n_kpoints, n_spin)
+!> \param eig_win_sorted SOC-corrected eigenvalues of the window, ascending
+!> \param ikp k-point index into eigenval_no_SOC
+!> \param n_spin number of spin channels
+!> \param n_ao number of AO basis functions (per spin)
+!> \param mo_index_start_1 first retained state index for spin 1
+!> \param mo_index_start_2 first retained state index for spin n_spin
+!> \param n_window per-spin window size
+!> \param n_window2tot total window size
+!> \param eigenval_spinor output: full repacked spinor spectrum (2*n_ao)
+! **************************************************************************************************
+   SUBROUTINE fill_truncated_eigenval_spinor(eigenval_no_SOC, eig_win_sorted, ikp, n_spin, n_ao, &
+                                             mo_index_start_1, mo_index_start_2, n_window, &
+                                             n_window2tot, eigenval_spinor)
+      REAL(KIND=dp), DIMENSION(:, :, :)                  :: eigenval_no_SOC
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eig_win_sorted
+      INTEGER                                            :: ikp, n_spin, n_ao, mo_index_start_1, &
+                                                            mo_index_start_2, n_window, &
+                                                            n_window2tot
+      REAL(KIND=dp), DIMENSION(:)                        :: eigenval_spinor
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'fill_truncated_eigenval_spinor'
+
+      INTEGER                                            :: handle, i, ia, ib, idx_end, idx_start, &
+                                                            mo_index_start_1_m1, &
+                                                            mo_index_start_2_m1
+
+      CALL timeset(routineN, handle)
+
+      ! verify the window was wide enough that SOC did not push a retained boundary state
+      ! past an excluded neighbor on either side -- this would invalidate the merge below
+      IF (mo_index_start_1 > 1) THEN
+         IF (eig_win_sorted(1) < eigenval_no_SOC(mo_index_start_1 - 1, ikp, 1)) THEN
+            CPABORT("SOC_NBANDS_OCC too small.")
+         END IF
+      END IF
+      IF (mo_index_start_2 > 1) THEN
+         IF (eig_win_sorted(1) < eigenval_no_SOC(mo_index_start_2 - 1, ikp, n_spin)) THEN
+            CPABORT("SOC_NBANDS_OCC too small.")
+         END IF
+      END IF
+      IF (mo_index_start_1 + n_window <= n_ao) THEN
+         IF (eig_win_sorted(n_window2tot) > eigenval_no_SOC(mo_index_start_1 + n_window, ikp, 1)) THEN
+            CPABORT("SOC_NBANDS_VIRT too small.")
+         END IF
+      END IF
+      IF (mo_index_start_2 + n_window <= n_ao) THEN
+         IF (eig_win_sorted(n_window2tot) > eigenval_no_SOC(mo_index_start_2 + n_window, ikp, n_spin)) THEN
+            CPABORT("SOC_NBANDS_VIRT too small.")
+         END IF
+      END IF
+
+      mo_index_start_1_m1 = mo_index_start_1 - 1
+      mo_index_start_2_m1 = mo_index_start_2 - 1
+
+      ia = 1
+      ib = 1
+      DO i = 1, mo_index_start_1_m1 + mo_index_start_2_m1
+         IF (ia <= mo_index_start_1_m1 .AND. ib <= mo_index_start_2_m1) THEN
+            IF (eigenval_no_SOC(ia, ikp, 1) <= eigenval_no_SOC(ib, ikp, n_spin)) THEN
+               eigenval_spinor(i) = eigenval_no_SOC(ia, ikp, 1)
+               ia = ia + 1
+            ELSE
+               eigenval_spinor(i) = eigenval_no_SOC(ib, ikp, n_spin)
+               ib = ib + 1
+            END IF
+         ELSE IF (ia <= mo_index_start_1_m1) THEN
+            eigenval_spinor(i) = eigenval_no_SOC(ia, ikp, 1)
+            ia = ia + 1
+         ELSE
+            eigenval_spinor(i) = eigenval_no_SOC(ib, ikp, n_spin)
+            ib = ib + 1
+         END IF
+      END DO
+
+      idx_start = mo_index_start_1_m1 + mo_index_start_2_m1 + 1
+      idx_end = mo_index_start_1_m1 + mo_index_start_2_m1 + n_window2tot
+
+      eigenval_spinor(idx_start:idx_end) = eig_win_sorted(:)
+
+      ia = mo_index_start_1 + n_window
+      ib = mo_index_start_2 + n_window
+      DO i = mo_index_start_1_m1 + mo_index_start_2_m1 + n_window2tot + 1, 2*n_ao
+         IF (ia <= n_ao .AND. ib <= n_ao) THEN
+            IF (eigenval_no_SOC(ia, ikp, 1) <= eigenval_no_SOC(ib, ikp, n_spin)) THEN
+               eigenval_spinor(i) = eigenval_no_SOC(ia, ikp, 1)
+               ia = ia + 1
+            ELSE
+               eigenval_spinor(i) = eigenval_no_SOC(ib, ikp, n_spin)
+               ib = ib + 1
+            END IF
+         ELSE IF (ia <= n_ao) THEN
+            eigenval_spinor(i) = eigenval_no_SOC(ia, ikp, 1)
+            ia = ia + 1
+         ELSE
+            eigenval_spinor(i) = eigenval_no_SOC(ib, ikp, n_spin)
+            ib = ib + 1
+         END IF
+      END DO
+
+      DEALLOCATE (eig_win_sorted)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE fill_truncated_eigenval_spinor
 ! **************************************************************************************************
 !> \brief ...
 !> \param DOS ...
@@ -2447,7 +3016,7 @@ CONTAINS
    END SUBROUTINE cfm_ikp_from_cfm_spinor_Gamma
 
 ! **************************************************************************************************
-!> \brief ...
+!> \brief Reconstruct a k-point operator from a real Gamma matrix using one MIC phase.
 !> \param cfm_ikp ...
 !> \param fm_Gamma ...
 !> \param ikp ...
@@ -2465,108 +3034,20 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'cfm_ikp_from_fm_Gamma'
 
-      INTEGER :: col_global, handle, i_atom, i_atom_old, i_cell, i_mic_cell, i_row, j_atom, &
-         j_atom_old, j_cell, j_col, n_bf, ncol_local, nrow_local, num_cells, row_global
+      INTEGER                                            :: handle
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_from_bf
-      INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
-      INTEGER, DIMENSION(:, :), POINTER                  :: index_to_cell
-      LOGICAL :: i_cell_is_the_minimum_image_cell
-      REAL(KIND=dp)                                      :: abs_rab_cell_i, abs_rab_cell_j, arg
-      REAL(KIND=dp), DIMENSION(3)                        :: cell_vector, cell_vector_j, rab_cell_i, &
-                                                            rab_cell_j
-      REAL(KIND=dp), DIMENSION(3, 3)                     :: hmat
       TYPE(cell_type), POINTER                           :: cell
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
 
       CALL timeset(routineN, handle)
 
-      IF (.NOT. ASSOCIATED(cfm_ikp%local_data)) THEN
-         CALL cp_cfm_create(cfm_ikp, fm_Gamma%matrix_struct)
-      END IF
-      CALL cp_cfm_set_all(cfm_ikp, z_zero)
-
-      CALL cp_fm_get_info(matrix=fm_Gamma, &
-                          nrow_local=nrow_local, &
-                          ncol_local=ncol_local, &
-                          row_indices=row_indices, &
-                          col_indices=col_indices)
-
-      ! get number of basis functions (bf) for different basis sets
-      IF (basis_type == "ORB") THEN
-         n_bf = qs_env%bs_env%n_ao
-      ELSE IF (basis_type == "RI_AUX") THEN
-         n_bf = qs_env%bs_env%n_RI
-      ELSE
-         CPABORT("Only ORB and RI_AUX basis implemented.")
-      END IF
-
-      ALLOCATE (atom_from_bf(n_bf))
-      CALL get_atom_index_from_basis_function_index(qs_env, atom_from_bf, n_bf, basis_type)
-
+      CPASSERT(basis_type == "ORB" .OR. basis_type == "RI_AUX")
+      ALLOCATE (atom_from_bf(fm_Gamma%matrix_struct%nrow_global))
+      CALL get_atom_index_from_basis_function_index(qs_env, atom_from_bf, SIZE(atom_from_bf), basis_type)
       NULLIFY (cell, particle_set)
       CALL get_qs_env(qs_env, cell=cell, particle_set=particle_set)
-      CALL get_cell(cell=cell, h=hmat)
-
-      index_to_cell => kpoints%index_to_cell
-
-      num_cells = SIZE(index_to_cell, 2)
-      i_atom_old = 0
-      j_atom_old = 0
-
-      DO j_col = 1, ncol_local
-         DO i_row = 1, nrow_local
-
-            row_global = row_indices(i_row)
-            col_global = col_indices(j_col)
-
-            i_atom = atom_from_bf(row_global)
-            j_atom = atom_from_bf(col_global)
-
-            ! we only need to check for new MIC cell for new i_atom-j_atom pair
-            IF (i_atom /= i_atom_old .OR. j_atom /= j_atom_old) THEN
-               DO i_cell = 1, num_cells
-
-                  ! only check nearest neigbors
-                  IF (ANY(ABS(index_to_cell(1:3, i_cell)) > 1)) CYCLE
-
-                  cell_vector(1:3) = MATMUL(hmat, REAL(index_to_cell(1:3, i_cell), dp))
-
-                  rab_cell_i(1:3) = pbc(particle_set(i_atom)%r(1:3), cell) - &
-                                    (pbc(particle_set(j_atom)%r(1:3), cell) + cell_vector(1:3))
-                  abs_rab_cell_i = SQRT(rab_cell_i(1)**2 + rab_cell_i(2)**2 + rab_cell_i(3)**2)
-
-                  ! minimum image convention
-                  i_cell_is_the_minimum_image_cell = .TRUE.
-                  DO j_cell = 1, num_cells
-                     cell_vector_j(1:3) = MATMUL(hmat, REAL(index_to_cell(1:3, j_cell), dp))
-                     rab_cell_j(1:3) = pbc(particle_set(i_atom)%r(1:3), cell) - &
-                                       (pbc(particle_set(j_atom)%r(1:3), cell) + cell_vector_j(1:3))
-                     abs_rab_cell_j = SQRT(rab_cell_j(1)**2 + rab_cell_j(2)**2 + rab_cell_j(3)**2)
-
-                     IF (abs_rab_cell_i > abs_rab_cell_j + 1.0E-6_dp) THEN
-                        i_cell_is_the_minimum_image_cell = .FALSE.
-                     END IF
-                  END DO
-
-                  IF (i_cell_is_the_minimum_image_cell) THEN
-                     i_mic_cell = i_cell
-                  END IF
-
-               END DO ! i_cell
-            END IF
-
-            arg = REAL(index_to_cell(1, i_mic_cell), dp)*kpoints%xkp(1, ikp) + &
-                  REAL(index_to_cell(2, i_mic_cell), dp)*kpoints%xkp(2, ikp) + &
-                  REAL(index_to_cell(3, i_mic_cell), dp)*kpoints%xkp(3, ikp)
-
-            cfm_ikp%local_data(i_row, j_col) = COS(twopi*arg)*fm_Gamma%local_data(i_row, j_col)*z_one + &
-                                               SIN(twopi*arg)*fm_Gamma%local_data(i_row, j_col)*gaussi
-
-            j_atom_old = j_atom
-            i_atom_old = i_atom
-
-         END DO ! j_col
-      END DO ! i_row
+      CALL fm_gamma_to_kp(cfm_ikp, fm_Gamma, cell, particle_set, atom_from_bf, &
+                          kpoints%index_to_cell, kpoints%xkp(:, ikp))
 
       CALL timestop(handle)
 
@@ -2777,13 +3258,13 @@ CONTAINS
 
       ! Calculate H^SOC_µν,σσ'(k) = sum_α V^SOC_µν^(α)(k)*Pauli-matrix^(α)_σσ'
       ! see Hartwigsen, Goedecker, Hutter, Eq.(18) (doi.org/10.1103/PhysRevB.58.3641)
-      SELECT CASE (bs_env%small_cell_full_kp_or_large_cell_Gamma)
-      CASE (large_cell_Gamma, large_cell_Gamma_ri_rs, non_periodic_ri_rs)
+      SELECT CASE (bs_env%gw_implementation)
+      CASE (tensor_large_cell_Gamma, ri_rs_large_cell_Gamma, ri_rs_non_periodic, tensor_static_cohsex)
 
          ! H^SOC_µν,σσ' = sum_α V^SOC_µν^(α)*Pauli-matrix^(α)_σσ'
          CALL H_KS_spinor_Gamma(bs_env)
 
-      CASE (small_cell_full_kp)
+      CASE (tensor_small_cell_full_kp)
 
          ! V^SOC_µν^(α),R -> V^SOC_µν^(α)(k); then calculate spinor H^SOC_µν,σσ'(k) (see above)
          CALL H_KS_spinor_kp(qs_env, bs_env)
@@ -2970,17 +3451,19 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       CALL get_VBM_CBM_bandgaps(bs_env%band_edges_scf, bs_env%eigenval_scf, bs_env)
-      CALL get_VBM_CBM_bandgaps(bs_env%band_edges_G0W0, bs_env%eigenval_G0W0, bs_env)
+      CALL get_VBM_CBM_bandgaps(bs_env%band_edges_GW, bs_env%eigenval_GW, bs_env)
       CALL get_VBM_CBM_bandgaps(bs_env%band_edges_HF, bs_env%eigenval_HF, bs_env)
 
       CALL check_qp_gap_sanity(bs_env)
+
+      CALL check_scf_gw_level_ordering(bs_env)
 
       CALL timestop(handle)
 
    END SUBROUTINE get_all_VBM_CBM_bandgaps
 
 ! **************************************************************************************************
-!> \brief Warn if the G0W0 fundamental band gap is inverted or implausibly large, i.e. if the
+!> \brief Warn if the GW fundamental band gap is inverted or implausibly large, i.e. if the
 !>        quasiparticle solve has produced a spectrum that cannot be physical.
 !> \param bs_env ...
 ! **************************************************************************************************
@@ -2988,25 +3471,133 @@ CONTAINS
 
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
 
+      CHARACTER(LEN=default_string_length)               :: gw_label
       REAL(KIND=dp)                                      :: gap, gap_scf
 
-      gap = bs_env%band_edges_G0W0%IDBG
+      gap = bs_env%band_edges_GW%IDBG
       gap_scf = bs_env%band_edges_scf%IDBG
+      gw_label = gw_flavour_label(bs_env)
 
       ! requiring a healthy SCF gap keeps the inversion test from firing on a genuine metal
       IF (gap < -eps_qp_gap .AND. gap_scf > eps_qp_gap) THEN
          CALL cp_warn(__LOCATION__, &
-                      "G0W0 band gap is negative ("// &
+                      TRIM(gw_label)//" band gap is negative ("// &
                       TRIM(ADJUSTL(cp_to_string(gap*evolt, '(F12.3)')))//" eV): the quasiparticle "// &
                       "spectrum is inverted. Check numerical parameters.")
       ELSE IF (ABS(gap) > max_qp_gap) THEN
          CALL cp_warn(__LOCATION__, &
-                      "G0W0 band gap is implausibly large ("// &
+                      TRIM(gw_label)//" band gap is implausibly large ("// &
                       TRIM(ADJUSTL(cp_to_string(gap*evolt, '(F12.3)')))//" eV): the quasiparticle "// &
                       "solve has likely diverged. Check numerical parameters.")
       END IF
 
    END SUBROUTINE check_qp_gap_sanity
+
+! **************************************************************************************************
+!> \brief Check whether the GW correction reorders the frontier levels with respect to the SCF
+!>        eigenvalues, i.e. whether the SCF HOMO (LUMO) is a different level than the GW HOMO
+!>        (LUMO). If so, the SCF and GW band edges printed afterwards belong to different
+!>        orbitals, which is easily overlooked => warn.
+!>        Levels closer than eps_degeneracy in the SCF spectrum count as degenerate, i.e. their
+!>        reordering by GW is not reported.
+!> \param bs_env ...
+! **************************************************************************************************
+   SUBROUTINE check_scf_gw_level_ordering(bs_env)
+
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'check_scf_gw_level_ordering'
+      REAL(KIND=dp), PARAMETER                           :: eps_degeneracy = 1.0E-05_dp
+
+      CHARACTER(LEN=default_string_length)               :: gw_label, level_gw, level_scf, &
+                                                            spin_string
+      CHARACTER(LEN=max_line_length)                     :: msg
+      INTEGER                                            :: handle, homo, ispin, n_mo
+      INTEGER, DIMENSION(2)                              :: loc_gw, loc_scf
+
+      CALL timeset(routineN, handle)
+
+      n_mo = bs_env%n_ao
+      gw_label = gw_flavour_label(bs_env)
+
+      DO ispin = 1, bs_env%n_spin
+
+         homo = bs_env%n_occ(ispin)
+
+         IF (bs_env%n_spin == 2) THEN
+            WRITE (spin_string, '(A,I0,A)') " (spin ", ispin, ")"
+         ELSE
+            spin_string = ""
+         END IF
+
+         ! occupied levels: level carrying the SCF VBM versus level carrying the GW VBM
+         loc_scf(:) = MAXLOC(bs_env%eigenval_scf(1:homo, :, ispin))
+         loc_gw(:) = MAXLOC(bs_env%eigenval_GW(1:homo, :, ispin))
+
+         ! only report a genuine reordering, not a permutation within a degenerate SCF shell
+         IF (bs_env%eigenval_scf(loc_scf(1), loc_scf(2), ispin) - &
+             bs_env%eigenval_scf(loc_gw(1), loc_gw(2), ispin) > eps_degeneracy) THEN
+
+            CALL level_string(level_scf, loc_scf, bs_env)
+            CALL level_string(level_gw, loc_gw, bs_env)
+
+            msg = TRIM(gw_label)//" reorders the occupied levels"//TRIM(spin_string)// &
+                  ": the SCF valence band maximum (SCF HOMO) is "//TRIM(level_scf)// &
+                  ", whereas the "//TRIM(gw_label)//" valence band maximum ("// &
+                  TRIM(gw_label)//" HOMO) is "//TRIM(level_gw)//". The SCF and "// &
+                  TRIM(gw_label)//" band edges printed below therefore belong to different "// &
+                  "orbitals; see the eigenvalues in the file bandstructure_SCF_and_G0W0."
+            CPWARN(TRIM(msg))
+
+         END IF
+
+         ! empty levels: level carrying the SCF CBM versus level carrying the GW CBM
+         loc_scf(:) = MINLOC(bs_env%eigenval_scf(homo + 1:n_mo, :, ispin))
+         loc_gw(:) = MINLOC(bs_env%eigenval_GW(homo + 1:n_mo, :, ispin))
+         loc_scf(1) = loc_scf(1) + homo
+         loc_gw(1) = loc_gw(1) + homo
+
+         IF (bs_env%eigenval_scf(loc_gw(1), loc_gw(2), ispin) - &
+             bs_env%eigenval_scf(loc_scf(1), loc_scf(2), ispin) > eps_degeneracy) THEN
+
+            CALL level_string(level_scf, loc_scf, bs_env)
+            CALL level_string(level_gw, loc_gw, bs_env)
+
+            msg = TRIM(gw_label)//" reorders the empty levels"//TRIM(spin_string)// &
+                  ": the SCF conduction band minimum (SCF LUMO) is "//TRIM(level_scf)// &
+                  ", whereas the "//TRIM(gw_label)//" conduction band minimum ("// &
+                  TRIM(gw_label)//" LUMO) is "//TRIM(level_gw)//". The SCF and "// &
+                  TRIM(gw_label)//" band edges printed below therefore belong to different "// &
+                  "orbitals; see the eigenvalues in the file bandstructure_SCF_and_G0W0."
+            CPWARN(TRIM(msg))
+
+         END IF
+
+      END DO
+
+      CALL timestop(handle)
+
+   END SUBROUTINE check_scf_gw_level_ordering
+
+! **************************************************************************************************
+!> \brief Human readable name of the level (i_mo, ikp) given as loc = [i_mo, ikp]
+!> \param string ...
+!> \param loc ...
+!> \param bs_env ...
+! **************************************************************************************************
+   SUBROUTINE level_string(string, loc, bs_env)
+
+      CHARACTER(LEN=*), INTENT(OUT)                      :: string
+      INTEGER, DIMENSION(2), INTENT(IN)                  :: loc
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+
+      IF (bs_env%nkp_bs_and_DOS > 1) THEN
+         WRITE (string, '(A,I0,A,I0)') "level ", loc(1), " at k-point ", loc(2)
+      ELSE
+         WRITE (string, '(A,I0)') "level ", loc(1)
+      END IF
+
+   END SUBROUTINE level_string
 
 ! **************************************************************************************************
 !> \brief ...
@@ -3063,9 +3654,98 @@ CONTAINS
          END DO
 
       END DO
+      SELECT CASE (bs_env%n_spin)
+      CASE (1)
+         CALL get_fermi_level_1c(bs_env, ev(:, :, 1), &
+                                 REAL(bs_env%n_electron(1), KIND=dp), &
+                                 bs_env%spin_degeneracy, band_edges%VBM, band_edges%CBM, band_edges%E_fermi)
+      CASE (2)
+         CALL get_fermi_level_2c(bs_env, ev(:, :, 1:2), &
+                                 REAL(bs_env%n_electron(1) + bs_env%n_electron(2), KIND=dp), &
+                                 band_edges%VBM, band_edges%CBM, band_edges%E_fermi)
+      END SELECT
 
       CALL timestop(handle)
 
    END SUBROUTINE get_VBM_CBM_bandgaps
 
+! **************************************************************************************************
+!> \brief Fermi level (chemical potential) for one set of band energies on the (weighted)
+!>        DOS k-point mesh bs_env%kpoints_DOS (band-structure-path k-points carry wkp=0 and
+!>        therefore do not contribute). Used both for a single spin-degenerate channel
+!>        (n_spin=1, maxocc=bs_env%spin_degeneracy=2) and for the spin-orbit-coupled spinor
+!>        space, where the two spins are already merged into one set of 2*n_ao states, each
+!>        holding at most one electron (maxocc=1).
+!>        IMPORTANT: Smearkp's T=0 bisection does *not* converge to the gap midpoint for a
+!>        real (flat) gap: N(mu) is exactly n_el for every mu in [VBM,CBM), so the bisection
+!>        exits on its very first probe, wherever that lands inside the gap, not at the
+!>        midpoint. Therefore Smearkp is only invoked when bs_env%do_smear is active (a
+!>        genuine metal, smeared with the ground-state SCF's &SMEAR settings); otherwise
+!>        E_fermi = VBM (highest occupied eigenvalue), matching the convention ABINIT uses
+!>        for its fixed-occupation-number case (occopt<3), rather than the gap midpoint.
+!> \param bs_env ...
+!> \param eigenval band energies (n_states, n_kpoints)
+!> \param n_el target (weighted) number of occupied states
+!> \param maxocc maximum occupation per state
+!> \param VBM valence band maximum, used as E_fermi when bs_env%do_smear = .FALSE.
+!> \param CBM conduction band minimum, used only to detect a wide gap
+!> \param e_fermi ...
+! **************************************************************************************************
+   SUBROUTINE get_fermi_level_1c(bs_env, eigenval, n_el, maxocc, VBM, CBM, e_fermi)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(KIND=dp), DIMENSION(:, :)                     :: eigenval
+      REAL(KIND=dp)                                      :: n_el, maxocc, VBM, CBM, e_fermi
+
+      REAL(KIND=dp), PARAMETER                           :: gap_smear_ratio = 20.0_dp
+
+      REAL(KIND=dp)                                      :: kTS
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: f_occ
+
+      IF (bs_env%do_smear .AND. .NOT. (CBM > VBM .AND. &
+                                       CBM - VBM > gap_smear_ratio*bs_env%smear_width)) THEN
+         ALLOCATE (f_occ(SIZE(eigenval, 1), SIZE(eigenval, 2)))
+         CALL Smearkp(f_occ, e_fermi, kTS, eigenval, n_el, &
+                      bs_env%kpoints_DOS%wkp(1:SIZE(eigenval, 2)), &
+                      bs_env%smear_width, maxocc, bs_env%smear_method)
+         DEALLOCATE (f_occ)
+      ELSE
+         e_fermi = VBM
+      END IF
+
+   END SUBROUTINE get_fermi_level_1c
+
+! **************************************************************************************************
+!> \brief Fermi level (chemical potential) shared across two spin channels with independent
+!>        band energies but the same chemical potential (standard spin-polarized DFT); see
+!>        get_fermi_level_1c for the k-point weighting and for why Smearkp2 is only used
+!>        when bs_env%do_smear is active (E_fermi = VBM otherwise).
+!> \param bs_env ...
+!> \param eigenval band energies (n_states, n_kpoints, 2)
+!> \param n_el target (weighted) total number of occupied states, summed over both spins
+!> \param VBM valence band maximum, used as E_fermi when bs_env%do_smear = .FALSE.
+!> \param CBM conduction band minimum, used only to detect a wide gap
+!> \param e_fermi ...
+! **************************************************************************************************
+   SUBROUTINE get_fermi_level_2c(bs_env, eigenval, n_el, VBM, CBM, e_fermi)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(KIND=dp), DIMENSION(:, :, :)                  :: eigenval
+      REAL(KIND=dp)                                      :: n_el, VBM, CBM, e_fermi
+
+      REAL(KIND=dp), PARAMETER                           :: gap_smear_ratio = 20.0_dp
+
+      REAL(KIND=dp)                                      :: kTS
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: f_occ
+
+      IF (bs_env%do_smear .AND. .NOT. (CBM > VBM .AND. &
+                                       CBM - VBM > gap_smear_ratio*bs_env%smear_width)) THEN
+         ALLOCATE (f_occ(SIZE(eigenval, 1), SIZE(eigenval, 2), 2))
+         CALL Smearkp2(f_occ, e_fermi, kTS, eigenval, n_el, &
+                       bs_env%kpoints_DOS%wkp(1:SIZE(eigenval, 2)), &
+                       bs_env%smear_width, bs_env%smear_method)
+         DEALLOCATE (f_occ)
+      ELSE
+         e_fermi = VBM
+      END IF
+
+   END SUBROUTINE get_fermi_level_2c
 END MODULE post_scf_bandstructure_utils

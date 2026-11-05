@@ -234,7 +234,12 @@ def process_file(fn: str, allow_modifications: bool) -> None:
         run_remote_tool("clangformat", fn)
 
     if re.match(r".*\.(cc|cpp|cxx|hcc|hpp|hxx)$", fn):
-        if basename in ["torch_c_api.cpp", "ace_c_api.cpp", "openpmd_c_api.cpp"]:
+        if basename in [
+            "torch_c_api.cpp",
+            "ace_c_api.cpp",
+            "openpmd_c_api.cpp",
+            "symmetrix_c_api.cpp",
+        ]:
             # Begrudgingly tolerated for C++ code with a narrow C ABI.
             run_remote_tool("clangformat", fn)
         else:
@@ -253,6 +258,9 @@ def process_file(fn: str, allow_modifications: bool) -> None:
 
     if re.match(r".*\.md$", fn):
         run_remote_tool("mdformat", fn)
+
+    if basename == "TEST_FILES.toml":
+        run_remote_tool("tombi", fn)
 
     if re.match(r"(.*/CMakeLists.txt)|(.*\.cmake)$", fn):
         run_remote_tool("cmakeformat", fn)
@@ -322,12 +330,14 @@ def run_remote_tool(tool: str, fn: str) -> None:
 
     url = f"{SERVER}/{tool}"
     r = http_post(url, fn)
+    body = r.read()
+    r.close()
     if r.status == 304:
         pass  # file not modified
     elif r.status == 200:
-        Path(fn).write_bytes(r.read())
+        Path(fn).write_bytes(body)
     else:
-        raise Exception(r.read().decode("utf8"))  # something went wrong
+        raise Exception(body.decode("utf8"))  # something went wrong
 
 
 # ======================================================================================

@@ -236,7 +236,7 @@ CONTAINS
 
       NULLIFY (pint_env%logger)
       pint_env%logger => cp_get_default_logger()
-      CALL cp_add_iter_level(pint_env%logger%iter_info, "PINT")
+      CALL cp_add_iter_level(pint_env%logger, "PINT")
 
       NULLIFY (pint_env%replicas, pint_env%input, pint_env%staging_env, &
                pint_env%normalmode_env, pint_env%propagator)
@@ -1892,7 +1892,7 @@ CONTAINS
       END DO
 
       ! remove iteration level
-      CALL cp_rm_iter_level(pint_env%logger%iter_info, "PINT")
+      CALL cp_rm_iter_level(pint_env%logger, "PINT")
 
    END SUBROUTINE pint_do_run
 
@@ -2007,7 +2007,7 @@ CONTAINS
       rn = REAL(pint_env%nrespa, dp)
       dti = pint_env%dt/rn
       dti2 = dti/2._dp
-      tdti = 2.*dti
+      tdti = 2._dp*dti
       dti22 = dti**2/2._dp
 
       ! Get constraint info, if needed
@@ -2238,7 +2238,7 @@ CONTAINS
                END IF
                DO i = 1, 6
                   tol = 0._dp
-                  pint_env%uv_new = pint_env%uv_t/(1.+dti2*pint_env%tv(1, :, :))
+                  pint_env%uv_new = pint_env%uv_t/(1._dp + dti2*pint_env%tv(1, :, :))
                   DO idim = 1, pint_env%ndim
                      DO ib = 1, pint_env%p
                         pint_env%tf(1, ib, idim) = (pint_env%mass_fict(ib, idim)* &
@@ -2825,7 +2825,7 @@ CONTAINS
             res = res + pint_env%mass_fict(ib, idim)*my_uv(ib, idim)**2
          END DO
       END DO
-      res = res*0.5
+      res = res*0.5_dp
       IF (.NOT. PRESENT(uv)) pint_env%e_kin_beads = res
       IF (PRESENT(e_k)) e_k = res
    END SUBROUTINE pint_calc_e_kin_beads_u

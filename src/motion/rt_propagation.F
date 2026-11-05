@@ -43,7 +43,10 @@ MODULE rt_propagation
                                               force_env_type
    USE global_types,                    ONLY: global_environment_type
    USE hfx_admm_utils,                  ONLY: hfx_admm_init
-   USE input_constants,                 ONLY: real_time_propagation,&
+   USE input_constants,                 ONLY: do_admm_basis_projection,&
+                                              do_admm_exch_scaling_none,&
+                                              do_admm_purify_none,&
+                                              real_time_propagation,&
                                               use_restart_wfn,&
                                               use_rt_restart,&
                                               use_scf_wfn
@@ -126,15 +129,17 @@ CONTAINS
       TYPE(force_env_type), POINTER                      :: force_env
 
       INTEGER                                            :: aspc_order
-      LOGICAL                                            :: magnetic, vel_reprs
+      LOGICAL                                            :: magnetic, track_current, &
+                                                            track_current_int, vel_reprs
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(global_environment_type), POINTER             :: globenv
       TYPE(qs_energy_type), POINTER                      :: energy
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(rt_prop_type), POINTER                        :: rtp
       TYPE(rtp_control_type), POINTER                    :: rtp_control
-      TYPE(section_vals_type), POINTER :: hfx_sections, input, ls_scf_section, md_section, &
-         motion_section, print_moments_section, rtp_print_section, rtp_section
+      TYPE(section_vals_type), POINTER :: current_int_section, current_section, hfx_sections, &
+         input, ls_scf_section, md_section, motion_section, print_moments_section, &
+         rtp_print_section, rtp_section
 
       NULLIFY (qs_env, rtp_control, dft_control)
 
@@ -143,6 +148,23 @@ CONTAINS
       CALL force_env_get(force_env=force_env, qs_env=qs_env, globenv=globenv)
       CALL get_qs_env(qs_env, dft_control=dft_control, energy=energy)
       rtp_control => dft_control%rtp_control
+
+      ! The RTP/EMD ADMM implementation (density fit, KS merge and forces) only supports
+      ! basis projection without purification and without exchange scaling
+      IF (dft_control%do_admm) THEN
+         IF (dft_control%admm_control%purification_method /= do_admm_purify_none) THEN
+            CALL cp_abort(__LOCATION__, "RTP/EMD with ADMM requires ADMM_PURIFICATION_METHOD NONE "// &
+                          "(the default is MO_DIAG). Use e.g. ADMM_TYPE ADMM2.")
+         END IF
+         IF (dft_control%admm_control%method /= do_admm_basis_projection) THEN
+            CALL cp_abort(__LOCATION__, "RTP/EMD with ADMM requires METHOD BASIS_PROJECTION. "// &
+                          "ADMMQ and ADMMS are not implemented for RTP/EMD.")
+         END IF
+         IF (dft_control%admm_control%scaling_model /= do_admm_exch_scaling_none) THEN
+            CALL cp_abort(__LOCATION__, "RTP/EMD with ADMM requires EXCH_SCALING_MODEL NONE. "// &
+                          "ADMMP and ADMMS are not implemented for RTP/EMD.")
+         END IF
+      END IF
 
       ! Takes care that an initial wavefunction/density is available
       ! Can either be by performing an scf loop or reading a restart
@@ -177,13 +199,25 @@ CONTAINS
       CALL section_vals_val_get(print_moments_section, "MAGNETIC", l_val=magnetic)
       CALL section_vals_val_get(print_moments_section, "VEL_REPRS", l_val=vel_reprs)
 
+      ! The imaginary part of the density matrix (needed for the current) is generically
+      ! nonzero whenever the propagated state is not stationary, independently of whether
+      ! an explicit time-dependent field/vector potential is applied: e.g. an excited
+      ! state prepared by occupation swap, from LR-TDDFT, or via a MOM-constrained SCF.
+      ! Rather than trying to detect every possible way of preparing such a state, track
+      ! the imaginary density whenever the user actually requests output that needs it.
+      rtp_print_section => section_vals_get_subs_vals(rtp_section, "PRINT")
+      current_section => section_vals_get_subs_vals(rtp_print_section, "CURRENT")
+      current_int_section => section_vals_get_subs_vals(rtp_print_section, "CURRENT_INT")
+      CALL section_vals_get(current_section, explicit=track_current)
+      CALL section_vals_get(current_int_section, explicit=track_current_int)
+
       rtp%track_imag_density = (magnetic) .OR. (vel_reprs) .OR. (rtp_control%velocity_gauge) &
-                               .OR. (rtp%do_hfx) .OR. (.NOT. rtp_control%fixed_ions)
+                               .OR. (rtp%do_hfx) .OR. (.NOT. rtp_control%fixed_ions) &
+                               .OR. (track_current) .OR. (track_current_int)
       rtp%propagate_complex_ks = rtp%do_hfx .OR. rtp_control%velocity_gauge
 
       ! Marek : In case some print sections that apply so far only to RTBSE are present,
       !         warn the user that the quantities will not be in fact printed out
-      rtp_print_section => section_vals_get_subs_vals(rtp_section, "PRINT")
       CALL warn_section_unused(rtp_print_section, "DENSITY_MATRIX", &
                                "DENSITY_MATRIX printing not implemented for non-RTBSE code.")
 
@@ -371,7 +405,7 @@ CONTAINS
 
       rtp%energy_old = energy%total
       time_iter_start = m_walltime()
-      CALL cp_add_iter_level(logger%iter_info, "MD")
+      CALL cp_add_iter_level(logger, "MD")
       CALL cp_iterate(logger%iter_info, iter_nr=0)
       IF (rtp%i_start >= max_steps) CALL cp_abort(__LOCATION__, &
                                                   "maximum step number smaller than initial step value")
@@ -444,7 +478,7 @@ CONTAINS
             EXIT
          END IF
       END DO
-      CALL cp_rm_iter_level(logger%iter_info, "MD")
+      CALL cp_rm_iter_level(logger, "MD")
 
       IF (.NOT. rtp%converged) THEN
          CALL cp_abort(__LOCATION__, "propagation did not converge, "// &

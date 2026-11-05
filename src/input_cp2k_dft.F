@@ -17,7 +17,7 @@ MODULE input_cp2k_dft
    USE bibliography,                    ONLY: &
         Andermatt2016, Andreussi2012, Andreussi2019, Avezac2005, Bengtsson1999, Blochl1995, &
         Brelaz1979, Chai2024a, Chai2025a, Fattebert2002, Guidon2010, Iannuzzi2006, Kunert2003, &
-        Marek2025, Merlot2014, Perdew1981, VandeVondele2005b, Yin2017
+        Marek2025, Mattiat2022, Merlot2014, Perdew1981, VandeVondele2005b, Yin2017
    USE cp_output_handling,              ONLY: add_last_numeric,&
                                               cp_print_key_section_create,&
                                               high_print_level,&
@@ -25,7 +25,6 @@ MODULE input_cp2k_dft
                                               medium_print_level,&
                                               silent_print_level
    USE cp_spline_utils,                 ONLY: pw_interp,&
-                                              spline3_nopbc_interp,&
                                               spline3_pbc_interp
    USE cp_units,                        ONLY: cp_unit_to_cp2k
    USE input_constants,                 ONLY: &
@@ -44,7 +43,7 @@ MODULE input_cp2k_dft
         numerical, plus_u_lowdin, plus_u_mulliken, plus_u_mulliken_charges, plus_u_tensorial, &
         real_time_propagation, rel_dkh, rel_none, rel_pot_erfc, rel_pot_full, rel_sczora_mp, &
         rel_trans_atom, rel_trans_full, rel_trans_molecule, rel_zora, rel_zora_full, rel_zora_mp, &
-        rtp_bse_ham_g0w0, rtp_bse_ham_ks, rtp_bse_kernel_ri_ao, rtp_bse_kernel_ri_default, &
+        rtp_bse_ham_gw, rtp_bse_ham_ks, rtp_bse_kernel_ri_ao, rtp_bse_kernel_ri_default, &
         rtp_bse_kernel_ri_rs, rtp_method_bse, rtp_method_tddft, sccs_andreussi, &
         sccs_derivative_cd3, sccs_derivative_cd5, sccs_derivative_cd7, sccs_derivative_fft, &
         sccs_fattebert_gygi, sccs_saa_andreussi, sic_ad, sic_eo, sic_list_all, sic_list_unpaired, &
@@ -58,6 +57,7 @@ MODULE input_cp2k_dft
    USE input_cp2k_external,             ONLY: create_ext_den_section,&
                                               create_ext_pot_section,&
                                               create_ext_vxc_section
+   USE input_cp2k_fde,                  ONLY: create_fde_section
    USE input_cp2k_field,                ONLY: create_efield_section,&
                                               create_per_efield_section
    USE input_cp2k_harris,               ONLY: create_harris_section
@@ -234,6 +234,20 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, &
+                          name="MTLR_REFERENCE_SCF", &
+                          description="Controls the unperturbed reference SCF for minimum tracking linear "// &
+                          "response. With SCF_GUESS ATOMIC, the default is OFF. If enabled, an unperturbed "// &
+                          "reference SCF is first converged and its orbitals initialize every perturbation. "// &
+                          "With SCF_GUESS RESTART, a reference SCF is required and uses the standard "// &
+                          "restart initial guess.", &
+                          repeats=.FALSE., &
+                          type_of_var=logical_t, &
+                          lone_keyword_l_val=.TRUE., &
+                          usage="MTLR_REFERENCE_SCF ON")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, &
                           name="MAX_MTLR_LOOP", &
                           description="Max number of iterations for calculated self-consistent linear response U and J.", &
                           repeats=.FALSE., &
@@ -379,6 +393,10 @@ CONTAINS
       CALL section_release(subsection)
 
       CALL create_kg_section(subsection)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
+
+      CALL create_fde_section(subsection)
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
 
@@ -1396,12 +1414,11 @@ CONTAINS
       NULLIFY (keyword, print_key)
 
       CALL keyword_create(keyword, __LOCATION__, name="kind", &
-                          description="the interpolator to use", &
+                          description="The interpolator to use. SPLINE3 automatically enables commensurate grids.", &
                           usage="kind spline3", &
                           default_i_val=pw_interp, &
-                          enum_c_vals=s2a("pw", "spline3_nopbc", "spline3"), &
-                          enum_i_vals=[pw_interp, &
-                                       spline3_nopbc_interp, spline3_pbc_interp])
+                          enum_c_vals=s2a("pw", "spline3"), &
+                          enum_i_vals=[pw_interp, spline3_pbc_interp])
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -1546,7 +1563,11 @@ CONTAINS
       CALL section_create(section, __LOCATION__, name="LOW_SPIN_ROKS", &
                           description="Specify the details of the low spin ROKS method. "// &
                           "In particular, one can specify various terms added to the energy of the high spin roks configuration"// &
-                          " with a energy scaling factor, and a prescription of the spin state.", &
+                          " with an energy scaling factor, and a prescription of the spin state. "// &
+                          "With METHOD GAPW, energies and orbital derivatives are supported for LDA/GGA, "// &
+                          "full-AO hybrids without ADMM, tau-dependent meta-GGAs, and molecular GauXC/Skala. "// &
+                          "Nuclear forces, analytical stress, and native-grid Skala are not supported with GAPW. "// &
+                          "The GauXC path requires isolated all-electron calculations with HOST execution.", &
                           n_keywords=6, n_subsections=0, repeats=.FALSE.)
 
       NULLIFY (keyword)
@@ -1584,7 +1605,7 @@ CONTAINS
                           description="Parameters needed to set up the real time propagation"// &
                           " for the electron dynamics. This currently works only in the NVE ensemble.", &
                           n_keywords=4, n_subsections=4, repeats=.FALSE., &
-                          citations=[Kunert2003, Andermatt2016])
+                          citations=[Kunert2003, Andermatt2016, Mattiat2022])
 
       CALL keyword_create(keyword, __LOCATION__, name="MAX_ITER", &
                           description="Maximal number of iterations for the self consistent propagator loop.", &
@@ -1850,35 +1871,23 @@ CONTAINS
       CALL section_release(print_key)
 
       CALL cp_print_key_section_create(print_key, __LOCATION__, "RESTART", &
-                                       description="Controls the dumping of the MO restart file during rtp. "// &
-                                       "By default keeps a short history of three restarts. "// &
-                                       "See also RESTART_HISTORY. In density propagation this controls the printing of "// &
-                                       "density matrix.", &
+                                       description="Controls the dumping of the latest wavefunction restart "// &
+                                       "file during rtp. In density propagation this controls the printing "// &
+                                       "of density matrix. See also RESTART_HISTORY.", &
                                        print_level=low_print_level, common_iter_levels=3, &
                                        each_iter_names=s2a("MD"), each_iter_values=[20], &
-                                       add_last=add_last_numeric, filename="RESTART")
-      CALL keyword_create(keyword, __LOCATION__, name="BACKUP_COPIES", &
-                          description="Specifies the maximum number of backup copies.", &
-                          usage="BACKUP_COPIES {int}", &
-                          default_i_val=1)
-      CALL section_add_keyword(print_key, keyword)
-      CALL keyword_release(keyword)
+                                       add_last=add_last_numeric, filename="RESTART", do_backup=.TRUE.)
       CALL section_add_subsection(print_section, print_key)
       CALL section_release(print_key)
 
       CALL cp_print_key_section_create(print_key, __LOCATION__, "RESTART_HISTORY", &
-                                       description="Dumps unique MO restart files during the run keeping all of them. "// &
-                                       "In density propagation it dumps the density matrix instead", &
+                                       description="Dumps unique wavefunction restart files during the run, "// &
+                                       "keeping all of them. In density propagation it dumps the density "// &
+                                       "matrix instead. For the latest wavefunction restart file, see RESTART.", &
                                        print_level=low_print_level, common_iter_levels=0, &
                                        each_iter_names=s2a("MD"), &
                                        each_iter_values=[500], &
-                                       filename="RESTART")
-      CALL keyword_create(keyword, __LOCATION__, name="BACKUP_COPIES", &
-                          description="Specifies the maximum number of backup copies.", &
-                          usage="BACKUP_COPIES {int}", &
-                          default_i_val=1)
-      CALL section_add_keyword(print_key, keyword)
-      CALL keyword_release(keyword)
+                                       filename="RESTART", do_backup=.TRUE.)
       CALL section_add_subsection(print_section, print_key)
       CALL section_release(print_key)
 
@@ -1898,7 +1907,7 @@ CONTAINS
 
       CALL cp_print_key_section_create(print_key, __LOCATION__, "CURRENT_INT", &
                                        description="Print the integral of the current density (only if the"// &
-                                       " imaginary part of the density is NOT zero.", &
+                                       " imaginary part of the density is NOT zero).", &
                                        print_level=high_print_level, common_iter_levels=1, &
                                        each_iter_names=s2a("MD"), &
                                        each_iter_values=[1], &
@@ -1911,13 +1920,7 @@ CONTAINS
                                        print_level=high_print_level, common_iter_levels=0, &
                                        each_iter_names=s2a("MD"), &
                                        each_iter_values=[20], &
-                                       filename="current")
-      CALL keyword_create(keyword, __LOCATION__, name="BACKUP_COPIES", &
-                          description="Specifies the maximum number of backup copies.", &
-                          usage="BACKUP_COPIES {int}", &
-                          default_i_val=1)
-      CALL section_add_keyword(print_key, keyword)
-      CALL keyword_release(keyword)
+                                       filename="current", do_backup=.TRUE.)
       CALL keyword_create(keyword, __LOCATION__, name="STRIDE", &
                           description="The stride (X,Y,Z) used to write the cube file "// &
                           "(larger values result in smaller cube files). You can provide 3 numbers (for X,Y,Z) or"// &
@@ -2088,12 +2091,13 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="RTBSE_HAMILTONIAN", &
                           description="Which Hamiltonian to use as the single-particle Hamiltonian"// &
                           " in the Green's propagator.", &
-                          usage="RTBSE_HAMILTONIAN G0W0", &
-                          default_i_val=rtp_bse_ham_g0w0, &
-                          enum_c_vals=s2a("KS", "G0W0"), &
-                          enum_i_vals=[rtp_bse_ham_ks, rtp_bse_ham_g0w0], &
-                          enum_desc=s2a("Use Kohn-Sham Hamiltonian for Green's propagation.", &
-                                        "Use G0W0 Hamiltonian for Green's function propagation"))
+                          usage="RTBSE_HAMILTONIAN GW", &
+                          default_i_val=rtp_bse_ham_gw, &
+                          enum_c_vals=s2a("KS", "GW"), &
+                          enum_i_vals=[rtp_bse_ham_ks, rtp_bse_ham_gw], &
+                          enum_desc=s2a("Use Kohn-Sham Hamiltonian for Green's function propagation.", &
+                                        "Use GW Hamiltonian for Green's function propagation. The GW "// &
+                                        "eigenvalues from the highest-level GW flavor will be picked."))
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -2221,6 +2225,29 @@ CONTAINS
                           usage="DIAGNOSE_LIOUVILLIAN_EIG", &
                           default_l_val=.FALSE., &
                           lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="EPS_FILTER_RHO", &
+                          description="RI-RS linearized RT-BSE: block-filter threshold on the propagated "// &
+                          "response density Delta-rho (AO). Applied upstream of the projection the "// &
+                          "Hartree shares, so it cuts the SEX kernel and the Hartree response alike. "// &
+                          "Absolute, so its strength is the ratio to the Delta-rho scale.", &
+                          usage="EPS_FILTER_RHO 1.0E-6", &
+                          default_r_val=-1.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="CUTOFF_RADIUS_W0", &
+                          description="RI-RS linearized RT-BSE: real-space truncation radius for the "// &
+                          "grid-basis screened interaction W0. Grid block pairs whose centroids lie "// &
+                          "further apart are dropped at build, and the per-step SEX grid transient is "// &
+                          "built into the same pattern. Affects the BSE kernel only, not the GW "// &
+                          "quasiparticle energies and not the Hartree response. Requires a "// &
+                          "non-periodic cell. Zero or negative disables the truncation.", &
+                          usage="CUTOFF_RADIUS_W0 30.0", &
+                          default_r_val=cp_unit_to_cp2k(value=-1.0_dp, unit_str="angstrom"), &
+                          type_of_var=real_t, unit_str="angstrom")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -2366,8 +2393,8 @@ CONTAINS
                           name="SCCS", &
                           description="Define the parameters for self-consistent continuum solvation (SCCS) model", &
                           citations=[Fattebert2002, Andreussi2012, Yin2017], &
-                          n_keywords=8, &
-                          n_subsections=3, &
+                          n_keywords=10, &
+                          n_subsections=4, &
                           repeats=.FALSE.)
 
       NULLIFY (keyword)
@@ -2525,7 +2552,56 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, &
+                          name="CORE_FILL", &
+                          description="Add a normalised Gaussian fill density $Z_{val}/(\sqrt{\pi}\sigma)^3 "// &
+                          "\exp(-r^2/\sigma^2)$ on each atom to the electronic density used for the "// &
+                          "definition of the dielectric function. This fills the low valence density "// &
+                          "region at the nuclei of pseudopotential atoms, which otherwise may be treated "// &
+                          "as solvent if a grid point is close to a nucleus (similar to the solvent_mode "// &
+                          "'full' of the Environ library). Kinds without removed core electrons (Z_val = Z, "// &
+                          "e.g. H, He-q2, Li-q3, Be-q4) are not filled by default. "// &
+                          "The resulting ionic forces are included.", &
+                          usage="CORE_FILL", &
+                          default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, &
+                          name="CORE_FILL_SPREAD", &
+                          description="Default spread $\sigma$ of the Gaussian fill density used with CORE_FILL "// &
+                          "(Environ default 0.5 bohr). Can be overwritten per kind in the CORE_FILL_KIND section.", &
+                          repeats=.FALSE., &
+                          n_var=1, &
+                          type_of_var=real_t, &
+                          unit_str="bohr", &
+                          default_r_val=0.5_dp, &
+                          usage="CORE_FILL_SPREAD [bohr] 0.5")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       NULLIFY (subsection)
+
+      CALL section_create(subsection, __LOCATION__, &
+                          name="CORE_FILL_KIND", &
+                          description="Per-kind spread of the CORE_FILL Gaussian fill density. "// &
+                          "Each line contains a kind label (as defined in &KIND) and the spread in bohr. "// &
+                          "A spread <= 0 disables the fill for that kind. Kinds not listed use "// &
+                          "CORE_FILL_SPREAD, except kinds without removed core electrons (Z_val = Z) which are "// &
+                          "not filled.", &
+                          n_keywords=1, &
+                          n_subsections=0, &
+                          repeats=.FALSE.)
+      CALL keyword_create(keyword, __LOCATION__, name="_DEFAULT_KEYWORD_", &
+                          description="Kind label and spread in bohr", &
+                          repeats=.TRUE., &
+                          usage="{kind label} {spread in bohr}", &
+                          type_of_var=lchar_t)
+      CALL section_add_keyword(subsection, keyword)
+      CALL keyword_release(keyword)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
 
       CALL section_create(subsection, __LOCATION__, &
                           name="ANDREUSSI", &

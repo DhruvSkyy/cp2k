@@ -144,7 +144,7 @@ CONTAINS
             kin = kin + r(1)*r(1) + r(2)*r(2) + r(3)*r(3)
          END DO
       END DO
-      kin = 1.5_dp*n/helium%tau - 0.5*kin/(b*helium%tau**2*helium%hb2m)
+      kin = 1.5_dp*n/helium%tau - 0.5_dp*kin/(b*helium%tau**2*helium%hb2m)
 
 ! TODO: move printing somewhere else ?
 !   print *,"POT = ",(pot/n+helium%e_corr)*kelvin,"K"
@@ -752,9 +752,10 @@ CONTAINS
          IF (PRESENT(force)) THEN
             helium%nnp%arc(ind)%layer(1)%node_grad(:) = 0.0_dp
             ALLOCATE (denergydsym(helium%nnp%arc(ind)%n_nodes(1)))
-            CALL nnp_calc_acsf(nnp, i, .TRUE.)
+            ! this path is serial and fills the shared nnp%arc(ind) directly
+            CALL nnp_calc_acsf(nnp, i, .TRUE., nnp%arc(ind))
          ELSE
-            CALL nnp_calc_acsf(nnp, i, .FALSE.)
+            CALL nnp_calc_acsf(nnp, i, .FALSE., nnp%arc(ind))
          END IF
 
          ! input nodes filled, perform prediction:

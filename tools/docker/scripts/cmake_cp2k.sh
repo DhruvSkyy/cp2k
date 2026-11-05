@@ -90,6 +90,45 @@ elif [[ "${PROFILE}" == "toolchain" ]] && [[ "${VERSION}" == "ssmp" ]]; then
     .. |& tee ./cmake.log
   CMAKE_EXIT_CODE=$?
 
+elif [[ "${PROFILE}" == "toolchain_mkl" ]] && [[ "${VERSION}" == "psmp" ]]; then
+  cmake \
+    --preset "native-gnu-x86_64" \
+    -GNinja \
+    -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
+    -DCP2K_BLAS_VENDOR=MKL \
+    -DCP2K_USE_EVERYTHING=ON \
+    -DCP2K_USE_MPI=ON \
+    -DCP2K_USE_LIBTORCH=OFF \
+    -DCP2K_USE_OPENPMD=OFF \
+    -DCP2K_USE_DEEPMD=OFF \
+    -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
+    -DCP2K_USE_MIMIC=OFF \
+    -DCP2K_USE_PEXSI=OFF \
+    -DCP2K_USE_DLAF=OFF \
+    -Werror=dev \
+    .. |& tee ./cmake.log
+  CMAKE_EXIT_CODE=$?
+
+elif [[ "${PROFILE}" == "toolchain_mkl" ]] && [[ "${VERSION}" == "ssmp" ]]; then
+  cmake \
+    --preset "native-gnu-x86_64" \
+    -GNinja \
+    -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
+    -DCP2K_BLAS_VENDOR=MKL \
+    -DCP2K_USE_EVERYTHING=ON \
+    -DCP2K_USE_MPI=OFF \
+    -DCP2K_USE_LIBTORCH=OFF \
+    -DCP2K_USE_DEEPMD=OFF \
+    -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
+    -DCP2K_USE_MIMIC=OFF \
+    -DCP2K_USE_PEXSI=OFF \
+    -DCP2K_USE_DLAF=OFF \
+    -Werror=dev \
+    .. |& tee ./cmake.log
+  CMAKE_EXIT_CODE=$?
+
 elif [[ "${PROFILE}" == "toolchain_intel" ]] && [[ "${VERSION}" == "psmp" ]]; then
   cmake \
     --preset "native-intel" \
@@ -99,7 +138,9 @@ elif [[ "${PROFILE}" == "toolchain_intel" ]] && [[ "${VERSION}" == "psmp" ]]; th
     -DCP2K_USE_LIBTORCH=OFF \
     -DCP2K_USE_OPENPMD=OFF \
     -DCP2K_USE_DEEPMD=OFF \
+    -DCP2K_USE_SYMMETRIX=OFF \
     -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
     -DCP2K_USE_MIMIC=OFF \
     -DCP2K_USE_PEXSI=OFF \
     -DCP2K_USE_DLAF=OFF \
@@ -116,7 +157,9 @@ elif [[ "${PROFILE}" == "toolchain_intel" ]] && [[ "${VERSION}" == "ssmp" ]]; th
     -DCP2K_USE_MPI=OFF \
     -DCP2K_USE_LIBTORCH=OFF \
     -DCP2K_USE_DEEPMD=OFF \
+    -DCP2K_USE_SYMMETRIX=OFF \
     -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
     -DCP2K_USE_MIMIC=OFF \
     -DCP2K_USE_PEXSI=OFF \
     -DCP2K_USE_DLAF=OFF \
@@ -134,8 +177,10 @@ elif [[ "${PROFILE}" == "toolchain_arm64" ]] && [[ "${VERSION}" == "psmp" ]]; th
     -DCP2K_USE_PEXSI=OFF \
     -DCP2K_USE_ACE=OFF \
     -DCP2K_USE_DEEPMD=OFF \
+    -DCP2K_USE_SYMMETRIX=OFF \
     -DCP2K_USE_LIBTORCH=OFF \
     -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
     -DCP2K_USE_OPENPMD=OFF \
     -Werror=dev \
     .. |& tee ./cmake.log
@@ -156,17 +201,19 @@ elif [[ "${PROFILE}" == "toolchain_cuda_"* ]] && [[ "${VERSION}" == "psmp" ]]; t
     -DCP2K_USE_PEXSI=OFF \
     -DCP2K_USE_ACE=OFF \
     -DCP2K_USE_DEEPMD=OFF \
+    -DCP2K_USE_SYMMETRIX=OFF \
     -DCP2K_USE_PLUMED=OFF \
     -DCP2K_USE_LIBSMEAGOL=OFF \
     -DCP2K_USE_LIBTORCH=OFF \
     -DCP2K_USE_GREENX=OFF \
-    -DCP2K_USE_SPGLIB=OFF \
     -DCP2K_USE_VORI=OFF \
     -DCP2K_USE_TREXIO=OFF \
     -DCP2K_USE_MIMIC=OFF \
     -DCP2K_USE_LIBFCI=OFF \
     -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
     -DCP2K_USE_OPENPMD=OFF \
+    -DCP2K_USE_SIRIUS=OFF \
     -Werror=dev \
     .. |& tee ./cmake.log
   CMAKE_EXIT_CODE=$?
@@ -192,19 +239,18 @@ elif [[ "${PROFILE}" == "toolchain_generic" ]] && [[ "${VERSION}" == "psmp" ]]; 
     -DCP2K_USE_EVERYTHING=ON \
     -DCP2K_USE_DLAF=OFF \
     -DCP2K_USE_PEXSI=OFF \
-    -DCP2K_USE_DEEPMD=OFF \
-    -DCP2K_USE_LIBTORCH=OFF \
     -DCP2K_USE_OPENPMD=OFF \
     -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
+    -DCP2K_USE_SYMMETRIX=OFF \
     -Werror=dev \
     .. |& tee ./cmake.log
   CMAKE_EXIT_CODE=$?
 
 elif [[ "${PROFILE}" == "toolchain_conventions" ]] && [[ "${VERSION}" == "psmp" ]]; then
   cmake \
-    --preset "native-gnu-x86_64" \
+    --preset "conventions" \
     -GNinja \
-    -DCMAKE_BUILD_TYPE="Conventions" \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
     -DCMAKE_Fortran_COMPILER_LAUNCHER="redirect_gfortran_output.py" \
     -DCP2K_USE_EVERYTHING=ON \
@@ -217,9 +263,8 @@ elif [[ "${PROFILE}" == "toolchain_conventions" ]] && [[ "${VERSION}" == "psmp" 
 
 elif [[ "${PROFILE}" == "toolchain_coverage" ]] && [[ "${VERSION}" == "psmp" ]]; then
   cmake \
-    --preset "native-gnu-x86_64" \
+    --preset "coverage" \
     -GNinja \
-    -DCMAKE_BUILD_TYPE="Coverage" \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
     -DCP2K_USE_EVERYTHING=ON \
     -DCP2K_USE_DLAF=OFF \
@@ -233,9 +278,8 @@ elif [[ "${PROFILE}" == "toolchain_asan" ]] && [[ "${VERSION}" == "psmp" ]]; the
   # TODO Re-enable GREENX. It currently leads to a heap-buffer-overflow
   # in `greenx_refine_pade()` at greenx_interface.F:80.
   cmake \
-    --preset "native-gnu-x86_64" \
+    --preset "asan" \
     -GNinja \
-    -DCMAKE_BUILD_TYPE="ASAN" \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
     -DCP2K_USE_EVERYTHING=ON \
     -DCP2K_USE_DLAF=OFF \
@@ -258,6 +302,7 @@ elif [[ "${PROFILE}" == "ubuntu" ]] && [[ "${VERSION}" == "ssmp" ]]; then
     -DCP2K_USE_EVERYTHING=ON \
     -DCP2K_USE_ACE=OFF \
     -DCP2K_USE_DEEPMD=OFF \
+    -DCP2K_USE_SYMMETRIX=OFF \
     -DCP2K_USE_DFTD4=OFF \
     -DCP2K_USE_TBLITE=OFF \
     -DCP2K_USE_GREENX=OFF \
@@ -270,6 +315,7 @@ elif [[ "${PROFILE}" == "ubuntu" ]] && [[ "${VERSION}" == "ssmp" ]]; then
     -DCP2K_USE_TREXIO=OFF \
     -DCP2K_USE_LIBFCI=OFF \
     -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
     -DCP2K_USE_OPENPMD=OFF \
     -Werror=dev \
     .. |& tee ./cmake.log

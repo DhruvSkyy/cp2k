@@ -17,11 +17,13 @@
 MODULE machine
    USE ISO_C_BINDING, ONLY: C_CHAR, &
                             C_INT, &
+                            C_SIZE_T, &
                             C_PTR, &
                             C_NULL_CHAR, &
                             C_ASSOCIATED
-   USE ISO_FORTRAN_ENV, ONLY: input_unit, &
-                              output_unit
+   USE ISO_FORTRAN_ENV, ONLY: ERROR_UNIT, &
+                              INPUT_UNIT, &
+                              OUTPUT_UNIT
    USE omp_lib, ONLY: omp_get_wtime
    USE kinds, ONLY: default_path_length, &
                     default_string_length, &
@@ -43,8 +45,9 @@ MODULE machine
    ! for example in farming or path integral runs
    ! default_input_unit should never be used
    ! but we need to know what it is, as we should not try to open it for output
-   INTEGER, PUBLIC, PARAMETER                   :: default_output_unit = output_unit, &
-                                                   default_input_unit = input_unit, &
+   INTEGER, PUBLIC, PARAMETER                   :: default_error_unit = ERROR_UNIT, &
+                                                   default_input_unit = INPUT_UNIT, &
+                                                   default_output_unit = OUTPUT_UNIT, &
                                                    timestamp_length = 23
 
 #include "machine_cpuid.h"
@@ -75,8 +78,8 @@ MODULE machine
    PRIVATE
 
    PUBLIC :: m_walltime, m_timestamp, m_hostnm, m_flush, &
-             m_getcwd, m_getlog, m_getpid, m_procrun, m_abort, &
-             m_chdir, m_mov, m_memory, m_memory_details, m_energy, &
+             m_getcwd, m_getexe, m_getlog, m_getpid, m_procrun, m_abort, &
+             m_chdir, m_mov, m_unlink, m_memory, m_memory_details, m_energy, &
              m_cpuinfo, m_cpuid_static, m_cpuid, m_cpuid_name, &
              m_cpuid_vlen, m_omp_get_stacksize, m_omp_trace_issues
 
@@ -333,7 +336,7 @@ CONTAINS
 #elif defined(__CRAY_PM_ACCEL_ENERGY)
       wt = read_energy("/sys/cray/pm_counters/accel_energy")
 #else
-      wt = 0.0 ! fallback default
+      wt = 0.0_dp ! fallback default
 #endif
 
    END FUNCTION m_energy
@@ -626,6 +629,33 @@ CONTAINS
       i = INDEX(tmp, c_null_char) - 1
       curdir = tmp(1:i)
    END SUBROUTINE m_getcwd
+
+! **************************************************************************************************
+!> \brief Returns the path of the running executable
+!> \param exe_path ...
+! **************************************************************************************************
+   SUBROUTINE m_getexe(exe_path)
+      CHARACTER(len=*), INTENT(OUT)            :: exe_path
+
+      CHARACTER(len=default_path_length), TARGET :: tmp
+      INTEGER                                  :: n
+
+      INTERFACE
+         FUNCTION readlink(path, buf, bufsiz) BIND(C, name="readlink") RESULT(nbytes)
+            IMPORT
+            CHARACTER(KIND=C_CHAR), DIMENSION(*)     :: path, buf
+            INTEGER(KIND=C_SIZE_T), VALUE            :: bufsiz
+            INTEGER(KIND=C_SIZE_T)                   :: nbytes
+         END FUNCTION readlink
+      END INTERFACE
+
+      n = INT(readlink("/proc/self/exe"//C_NULL_CHAR, tmp, INT(LEN(tmp), C_SIZE_T)))
+      IF (n > 0 .AND. n < LEN(tmp)) THEN
+         exe_path = tmp(1:n)
+      ELSE
+         CALL GET_COMMAND_ARGUMENT(0, exe_path)
+      END IF
+   END SUBROUTINE m_getexe
 
 ! **************************************************************************************************
 !> \brief ...

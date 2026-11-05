@@ -6,8 +6,8 @@
 [ "${BASH_SOURCE[0]}" ] && SCRIPT_NAME="${BASH_SOURCE[0]}" || SCRIPT_NAME=$0
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_NAME")/.." && pwd -P)"
 
-libxs_ver="1.0.0"
-libxs_sha256="de26f50cb986a2f0e4f92c0eb489d40a44f7e4c5acd22751a6cfa2829dabd04d"
+libxs_ver="930a2c4"
+libxs_sha256="552f9dd5af66b593d81aeb5aeb8acedba01943ae8d0c1bc036ea79f5fa591e88"
 source "${SCRIPT_DIR}"/common_vars.sh
 source "${SCRIPT_DIR}"/tool_kit.sh
 source "${SCRIPT_DIR}"/signal_trap.sh
@@ -27,7 +27,12 @@ case "$with_libxs" in
     if verify_checksums "${install_lock_file}"; then
       echo "libxs-${libxs_ver} is already installed, skipping it."
     else
-      retrieve_package "${libxs_sha256}" "libxs-${libxs_ver}.tar.gz"
+      if [ -f "libxs-${libxs_ver}.tar.gz" ] && checksum "${libxs_sha256}" "libxs-${libxs_ver}.tar.gz"; then
+        echo "libxs-${libxs_ver}.tar.gz is found and checksum is right"
+      else
+        download_pkg_from_urlpath "${libxs_sha256}" "${libxs_ver}" \
+          https://codeload.github.com/hfp/libxs/tar.gz "libxs-${libxs_ver}.tar.gz"
+      fi
       [ -d libxs-${libxs_ver} ] && rm -rf libxs-${libxs_ver}
       tar -xzf libxs-${libxs_ver}.tar.gz
 

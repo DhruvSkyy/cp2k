@@ -29,7 +29,7 @@ MODULE input_cp2k_mm
         do_ff_amber, do_ff_charmm, do_ff_cubic, do_ff_fues, do_ff_g87, do_ff_g96, do_ff_harmonic, &
         do_ff_legendre, do_ff_mixed_bend_stretch, do_ff_mm2, do_ff_mm3, do_ff_mm4, do_ff_morse, &
         do_ff_opls, do_ff_quartic, do_ff_undef
-   USE fparser,                         ONLY: docf
+   USE generic_function_input,          ONLY: create_function_section
    USE input_constants,                 ONLY: use_mom_ref_coac,&
                                               use_mom_ref_com,&
                                               use_mom_ref_user,&
@@ -1299,58 +1299,24 @@ CONTAINS
       TYPE(keyword_type), POINTER                        :: keyword
 
       CPASSERT(.NOT. ASSOCIATED(section))
-      CALL section_create(section, __LOCATION__, name="GENPOT", &
-                          description="This section specifies the input parameters for a generic potential type. "// &
-                          docf(), &
-                          n_keywords=1, n_subsections=0, repeats=.TRUE.)
+
+      CALL create_function_section(section, "GENPOT", "FUNCTION", &
+                                   description="This section specifies a generic potential function "// &
+                                   "between two kinds of atoms (identical or distinct). The VARIABLES "// &
+                                   "keyword should define exactly one symbol as the variable in the "// &
+                                   "generic function.", &
+                                   repeats=.TRUE.)
 
       NULLIFY (keyword)
-
       CALL keyword_create(keyword, __LOCATION__, name="ATOMS", &
-                          description="Defines the atomic kind involved in the generic potential", &
-                          usage="ATOMS {KIND1} {KIND2}", type_of_var=char_t, &
-                          n_var=2)
-      CALL section_add_keyword(section, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="FUNCTION", &
-                          description="Specifies the functional form in mathematical notation.", &
-                          usage="FUNCTION a\*EXP(-b\*x^2)/x+D\*log10(x)", type_of_var=lchar_t, &
-                          n_var=1)
-      CALL section_add_keyword(section, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="VARIABLES", &
-                          description="Defines the variable of the functional form.", &
-                          usage="VARIABLES x", type_of_var=char_t, &
-                          n_var=-1)
-      CALL section_add_keyword(section, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="PARAMETERS", &
-                          description="Defines the parameters of the functional form", &
-                          usage="PARAMETERS a b D", type_of_var=char_t, &
-                          n_var=-1, repeats=.TRUE.)
-      CALL section_add_keyword(section, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="VALUES", &
-                          description="Defines the values of parameter of the functional form", &
-                          usage="VALUES ", type_of_var=real_t, &
-                          n_var=-1, repeats=.TRUE., unit_str="internal_cp2k")
-      CALL section_add_keyword(section, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="UNITS", &
-                          description="Optionally, allows to define valid CP2K unit strings for each parameter value. "// &
-                          "It is assumed that the corresponding parameter value is specified in this unit.", &
-                          usage="UNITS angstrom eV*angstrom^-1 angstrom^1 K", type_of_var=char_t, &
-                          n_var=-1, repeats=.TRUE.)
+                          description="Defines the two atomic kinds involved in the generic "// &
+                          "potential function. The kind names are not case sensitive.", &
+                          usage="ATOMS {KIND1} {KIND2}", type_of_var=char_t, n_var=2)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="RCUT", &
-                          description="Defines the cutoff parameter of the generic potential", &
+                          description="Defines the cutoff parameter of the generic potential.", &
                           usage="RCUT {real}", default_r_val=cp_unit_to_cp2k(value=10.0_dp, &
                                                                              unit_str="angstrom"), &
                           unit_str="angstrom")
@@ -1358,15 +1324,15 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="RMIN", &
-                          description="Defines the lower bound of the potential. If not set the range is the"// &
-                          " full range generate by the spline", usage="RMIN {real}", &
+                          description="Defines the lower bound of the potential. If not set the "// &
+                          "range is the full range generated by the spline.", usage="RMIN {real}", &
                           type_of_var=real_t, unit_str="angstrom")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="RMAX", &
-                          description="Defines the upper bound of the potential. If not set the range is the"// &
-                          " full range generate by the spline", usage="RMAX {real}", &
+                          description="Defines the upper bound of the potential. If not set the "// &
+                          "range is the full range generated by the spline.", usage="RMAX {real}", &
                           type_of_var=real_t, unit_str="angstrom")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
@@ -1488,9 +1454,10 @@ CONTAINS
    END SUBROUTINE create_NEQUIP_section
 
 ! **************************************************************************************************
-!> \brief This section specifies the input parameters for MACE potential type
+!> \brief This section specifies the input parameters for a MACE potential,
+!>        evaluated through a selectable inference backend
 !> \param section the section to create
-!> \author Xinyue Sun
+!> \author Xinyue Sun and Dhruv Sharma
 ! **************************************************************************************************
    SUBROUTINE create_MACE_section(section)
       TYPE(section_type), POINTER                        :: section
@@ -1499,14 +1466,28 @@ CONTAINS
 
       CPASSERT(.NOT. ASSOCIATED(section))
       CALL section_create(section, __LOCATION__, name="MACE", &
-                          description="This section specifies the input parameters for MACE potential type, "// &
-                          "a higher-order equivariant message-passing neural network. "// &
-                          "The MACE model must be exported to a TorchScript file that takes a single "// &
-                          "dictionary argument (see the create_cp2k_model.py helper). "// &
-                          "Requires linking with libtorch library from <https://pytorch.org/cppdocs/installing.html>.", &
-                          citations=[Batatia2022], n_keywords=1, n_subsections=0, repeats=.FALSE.)
+                          description="This section specifies the input parameters for a MACE "// &
+                          "machine-learning interatomic potential, a higher-order equivariant "// &
+                          "message-passing neural network, evaluated through a selectable inference "// &
+                          "BACKEND with otherwise identical input. TORCH (the default) runs a "// &
+                          "TorchScript model exported with the create_cp2k_model.py helper and "// &
+                          "requires linking with libtorch <https://pytorch.org/cppdocs/installing.html>. "// &
+                          "SYMMETRIX runs a symmetrix model (.json) with torch-free C++/Kokkos kernels "// &
+                          "and requires linking with libsymmetrix. MACE models use standardized units "// &
+                          "(Angstrom for length, eV for energy, eV/Angstrom for forces), so no unit "// &
+                          "keywords are required.", &
+                          citations=[Batatia2022], n_keywords=3, n_subsections=0, repeats=.FALSE.)
 
       NULLIFY (keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="BACKEND", &
+                          description="Inference backend evaluating the MACE model: TORCH (default, "// &
+                          "TorchScript via libtorch) or SYMMETRIX (torch-free C++/Kokkos via "// &
+                          "libsymmetrix). The model file must be exported for the chosen backend "// &
+                          "(see POT_FILE_NAME).", &
+                          usage="BACKEND SYMMETRIX", default_lc_val="TORCH")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="ATOMS", &
                           description="Defines the atomic kinds involved in the MACE potential. "// &
@@ -1520,9 +1501,9 @@ CONTAINS
 
       CALL keyword_create(keyword, __LOCATION__, name="POT_FILE_NAME", &
                           variants=["MODEL_FILE_NAME"], &
-                          description="Specifies the filename that contains the exported MACE model. "// &
-                          "MACE models use standardized units (Angstrom for length, eV for energy, "// &
-                          "eV/Angstrom for forces), so no unit keywords are required.", &
+                          description="Specifies the filename that contains the exported MACE model: "// &
+                          "a TorchScript file for BACKEND TORCH or a symmetrix .json file for "// &
+                          "BACKEND SYMMETRIX.", &
                           usage="POT_FILE_NAME {FILENAME}", default_lc_val=" ")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
@@ -2930,7 +2911,8 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, &
                           name="PERIODIC", &
                           description="Use Berry phase formula (PERIODIC=T) or simple operator (PERIODIC=F). "// &
-                          "The latter normally requires that the CELL is periodic NONE.", &
+                          "For the simple dipole operator, only components perpendicular to the periodic "// &
+                          "lattice vectors are well-defined. All components are well-defined for CELL PERIODIC NONE.", &
                           usage="PERIODIC {logical}", &
                           repeats=.FALSE., &
                           n_var=1, &

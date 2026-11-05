@@ -29,11 +29,11 @@ MODULE input_cp2k_motion
                                  medium_print_level
    USE cp_units, ONLY: cp_unit_to_cp2k
    USE input_constants, ONLY: &
-      debug_lbfgs, default_bfgs_method_id, default_cg_method_id, default_dimer_method_id, &
+      bfgs_direct, bfgs_inverse, debug_lbfgs, default_bfgs_method_id, default_cg_method_id, default_dimer_method_id, &
       default_lbfgs_method_id, default_minimization_method_id, default_ts_method_id, &
       dimer_init_molden, dimer_init_random, &
-      do_mc_gemc_npt, do_mc_gemc_nvt, do_mc_traditional, do_mc_virial, fix_none, fix_x, fix_xy, &
-      fix_xz, fix_y, fix_yz, fix_z, fmt_id_pdb, fmt_id_xyz, gaussian, helium_cell_shape_cube, &
+      do_mc_gemc_npt, do_mc_gemc_nvt, do_mc_traditional, do_mc_virial, fmt_id_pdb, fmt_id_xyz, &
+      gaussian, helium_cell_shape_cube, &
       helium_cell_shape_octahedron, helium_forces_average, helium_forces_last, &
       helium_mdist_exponential, helium_mdist_gaussian, helium_mdist_linear, &
       helium_mdist_quadratic, helium_mdist_singlev, helium_mdist_uniform, &
@@ -874,7 +874,8 @@ CONTAINS
       CALL keyword_create( &
          keyword, __LOCATION__, name="KEEP_SPACE_GROUP", &
          description="Detect space group of the system and preserve it during optimization. "// &
-         "The space group symmetry is applied to coordinates, forces, and the stress tensor. "// &
+         "The space group symmetry is applied to coordinates, forces, the stress tensor, and "// &
+         "the CELL_OPT cell metric. "// &
          "It works for supercell. It does not affect/reduce computational cost. "// &
          "Use EPS_SYMMETRY to adjust the detection threshold.", &
          usage="KEEP_SPACE_GROUP .TRUE.", &
@@ -1082,18 +1083,23 @@ CONTAINS
 
       CALL keyword_create( &
          keyword, __LOCATION__, name="CONSTRAINT", &
-         description="Imposes a constraint on the pressure tensor by fixing the specified cell components.", &
-         usage="CONSTRAINT (none|x|y|z|xy|xz|yz)", &
-         enum_desc=s2a("Fix nothing", &
-                       "Fix only x component", &
-                       "Fix only y component", &
-                       "Fix only z component", &
-                       "Fix x and y component", &
-                       "Fix x and z component", &
-                       "Fix y and z component"), &
-         enum_c_vals=s2a("NONE", "X", "Y", "Z", "XY", "XZ", "YZ"), &
-         enum_i_vals=[fix_none, fix_x, fix_y, fix_z, fix_xy, fix_xz, fix_yz], &
-         default_i_val=fix_none)
+         description="Imposes a constraint on the pressure tensor by fixing the specified cell components. "// &
+         "Cell convention: a lies along x, b lies in the xy plane. The six independent components "// &
+         "are AX, BX, BY, CX, CY, CZ. A, B and C fix a complete cell vector: A = AX, B = BX and BY, "// &
+         "C = CX, CY and CZ. X, Y and Z follow the legacy direction tokens. X fixes every x "// &
+         "component: AX, BX and CX. Y fixes the complete b vector and the y component of c: "// &
+         "BX, BY and CY. Z fixes the complete c vector, because only c has a z component: Z equals C. "// &
+         "Accepted tokens: NONE, A, B, C, X, Y, Z, XY, XZ, YZ, AX, BX, BY, CX, CY, CZ. "// &
+         "Several tokens may be given on one line, the union of the fixed components is used. "// &
+         "NONE must stand alone, redundant tokens give a warning, and angle constraints "// &
+         "(ALPHA, BETA, GAMMA) are not supported yet. On a non-orthorhombic cell a constraint "// &
+         "that pins a shear component (BX, CX, CY), or a fixed diagonal component together "// &
+         "with KEEP_ANGLES, draws a warning: the pressure criterion is then met only when "// &
+         "the pinned values match the stress-free cell; otherwise it can stay off the "// &
+         "external pressure at the constrained minimum. Check the per-step pressure "// &
+         "convergence report.", &
+         usage="CONSTRAINT {NONE} | ({A|B|C|X|Y|Z|XY|XZ|YZ|AX|BX|BY|CX|CY|CZ} ...)", &
+         type_of_var=char_t, n_var=-1, default_c_vals=["NONE"])
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -1320,6 +1326,15 @@ CONTAINS
                           description="Provides parameters to tune the BFGS optimization", &
                           n_keywords=0, n_subsections=1, repeats=.FALSE.)
 
+      CALL keyword_create(keyword, __LOCATION__, name="METHOD", &
+                          description="Matrix updated by full-memory BFGS. DIRECT updates the Hessian; "// &
+                          "INVERSE updates its inverse without a full diagonalization at each step.", &
+                          usage="METHOD INVERSE", &
+                          enum_c_vals=s2a("DIRECT", "INVERSE"), &
+                          enum_i_vals=[bfgs_direct, bfgs_inverse], default_i_val=bfgs_direct)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="TRUST_RADIUS", &
                           description="Trust radius used in BFGS. Previously set to 0.1. "// &
                           "Large values can lead to instabilities", &
@@ -1338,15 +1353,17 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="USE_RAT_FUN_OPT", &
-                          description="Includes a rational function optimization to determine the step."// &
-                          " Previously default but did not improve convergence in many cases", &
+                          description="Includes a rational function optimization to determine the step. "// &
+                          "Previously default but did not improve convergence in many cases. "// &
+                          "Not supported by inverse-Hessian update method.", &
                           usage="USE_RAT_FUN_OPT", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="RESTART_HESSIAN", &
-                          description="Controls the reading of the initial Hessian from file.", &
+                          description="Reads the initial BFGS matrix from file. Hessian and inverse-Hessian "// &
+                          "restarts are converted to the selected METHOD when necessary.", &
                           usage="RESTART_HESSIAN", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
@@ -2938,13 +2955,7 @@ CONTAINS
                                        "(Gaussian cube file format)", &
                                        each_iter_names=s2a("PINT"), each_iter_values=[100], &
                                        print_level=medium_print_level, common_iter_levels=1, &
-                                       add_last=add_last_numeric)
-      CALL keyword_create(keyword, __LOCATION__, name="BACKUP_COPIES", &
-                          description="Specifies the maximum number of backup copies.", &
-                          usage="BACKUP_COPIES {int}", &
-                          default_i_val=1)
-      CALL section_add_keyword(print_key, keyword)
-      CALL keyword_release(keyword)
+                                       add_last=add_last_numeric, do_backup=.TRUE.)
       CALL section_add_subsection(subsection, print_key)
       CALL section_release(print_key)
       !
